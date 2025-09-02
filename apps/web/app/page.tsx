@@ -12,6 +12,10 @@ export default function HomePage() {
   const chartRef = useRef<ReturnType<typeof createChart> | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
 
+  const defaultSymbols = (process.env.NEXT_PUBLIC_SYMBOLS || '2330.TW,AAPL')
+    .split(',').map(s=>s.trim()).filter(Boolean);
+  const [symbols, setSymbols] = useState<string[]>(defaultSymbols);
+  const [newSym, setNewSym] = useState('');
   const [symbol, setSymbol] = useState('2330.TW');
   const [range, setRange] = useState<{start?: string; end?: string}>({});
   const [tf, setTf] = useState<'5m'|'15m'|'1h'|'1d'>('1d');
@@ -19,6 +23,11 @@ export default function HomePage() {
   const [loading, setLoading] = useState(false);
   const [minStepSec, setMinStepSec] = useState<number | null>(null);
   const [rangeLabel, setRangeLabel] = useState<string>('');
+  const [symbolOpen, setSymbolOpen] = useState(false);
+  const symbolMenuRef = useRef<HTMLDivElement | null>(null);
+  const [tfOpen, setTfOpen] = useState(false);
+  const tfMenuRef = useRef<HTMLDivElement | null>(null);
+  const tfLabels: Record<string,string> = { '5m':'5 分鐘', '15m':'15 分鐘', '1h':'1 小時', '1d':'1 天' };
 
   const fetchOhlcv = async (sym: string, timeframe: string) => {
     // Choose sensible default ranges per timeframe to avoid short windows
@@ -58,7 +67,7 @@ export default function HomePage() {
   useEffect(() => {
     if (!containerRef.current) return;
     const chart = createChart(containerRef.current, {
-      height: 460,
+      height: 560,
       layout: { background: { type: ColorType.Solid, color: 'transparent' }, textColor: '#334155' },
       grid: { vertLines: { color: '#e2e8f0' }, horzLines: { color: '#e2e8f0' } },
       rightPriceScale: { borderColor: '#cbd5e1' },
@@ -76,15 +85,17 @@ export default function HomePage() {
     window.addEventListener('resize', resize);
 
     setError(null);
-    fetchOhlcv(symbol, tf)
-      .then(data => {
-        series.setData(data);
-        chart.timeScale().fitContent();
-      })
-      .catch((e: unknown) => {
-        const msg = e instanceof Error ? e.message : String(e);
-        setError(msg);
-      });
+    if (symbol.trim()) {
+      fetchOhlcv(symbol, tf)
+        .then(data => {
+          series.setData(data);
+          chart.timeScale().fitContent();
+        })
+        .catch((e: unknown) => {
+          const msg = e instanceof Error ? e.message : String(e);
+          setError(msg);
+        });
+    }
 
     // Robust time handling for BusinessDay (daily) and epoch seconds (intraday)
     type ChartTime = number | { year: number; month: number; day: number };
@@ -118,6 +129,34 @@ export default function HomePage() {
     return () => { window.removeEventListener('resize', resize); chart.remove(); };
   }, []);
 
+  // Load/save custom symbols list from localStorage
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('finlab_symbols');
+      if (saved) {
+        const arr = JSON.parse(saved);
+        if (Array.isArray(arr) && arr.every(x => typeof x === 'string')) {
+          setSymbols(Array.from(new Set(arr)) as string[]);
+          if (!arr.includes(symbol) && arr.length > 0) setSymbol(arr[0]);
+        }
+      }
+    } catch {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    try { localStorage.setItem('finlab_symbols', JSON.stringify(symbols)); } catch {}
+  }, [symbols]);
+
+  useEffect(() => {
+    const onDoc = (e: MouseEvent) => {
+      const node = e.target as Node;
+      if (symbolMenuRef.current && !symbolMenuRef.current.contains(node)) setSymbolOpen(false);
+      if (tfMenuRef.current && !tfMenuRef.current.contains(node)) setTfOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, []);
+
   // Live data: no DB meta; clear any previous state
   useEffect(() => { setMinStepSec(null); }, [symbol]);
 
@@ -137,6 +176,7 @@ export default function HomePage() {
     let cancelled = false;
     const tick = () => {
       setError(null);
+      if (!symbol.trim()) return;
       fetchOhlcv(symbol, tf)
         .then(d => { if (!cancelled) { seriesRef.current?.setData(d); /* do not refit on every refresh */ } })
         .catch((e: unknown)=>{
@@ -155,7 +195,7 @@ export default function HomePage() {
       alert('請先在圖上點兩下選取起訖（第一次點＝起點；第二次點＝終點）');
       return;
     }
-    const m = 1;
+    const m = 30;
     // Quick client-side validation to reduce 400s
     try {
       const start = new Date(range.start);
@@ -172,7 +212,7 @@ export default function HomePage() {
       const res = await fetch(url, {
         method: 'POST',
         headers: {'Content-Type':'application/json','Accept':'application/json'},
-        body: JSON.stringify({ symbol, start: range.start, end: range.end, m, top: 5 })
+        body: JSON.stringify({ symbol, start: range.start, end: range.end, m, top: 5, universe: symbols })
       });
       if (!res.ok) {
         const text = await res.text().catch(() => '');
@@ -186,6 +226,36 @@ export default function HomePage() {
     }
   };
 
+  const onDetectPattern = async () => {
+    if (!range.start || !range.end) {
+      alert('請先在圖上點兩下選取起訖（第一次點＝起點；第二次點＝終點）');
+      return;
+    }
+    try {
+      const url = `/api/pattern/classify`;
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ symbol, start: range.start, end: range.end, tf }),
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`POST ${url} failed: HTTP ${res.status}${text ? ` - ${text}` : ''}`);
+      }
+      const j = await res.json();
+      const nameMap: Record<string,string> = {
+        sym_triangle: '對稱三角形',
+        asc_triangle: '上升三角形',
+        desc_triangle: '下降三角形',
+        unknown: '未辨識/非三角形'
+      };
+      alert(`型態辨識：${nameMap[j.label] || j.label}\n信心：${(j.confidence*100).toFixed(0)}%\n詳細：\n- 高點斜率: ${j.meta?.slope_high?.toFixed?.(6)}\n- 低點斜率: ${j.meta?.slope_low?.toFixed?.(6)}\n- R2(高/低): ${j.meta?.r2_high?.toFixed?.(2)} / ${j.meta?.r2_low?.toFixed?.(2)}\n- 範圍收斂比: ${j.meta?.contraction?.toFixed?.(2)}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      alert('型態辨識失敗：\n' + msg);
+    }
+  };
+
   return (
     <main className="app" suppressHydrationWarning>
       <div className="header" suppressHydrationWarning>
@@ -193,21 +263,59 @@ export default function HomePage() {
       </div>
       <div className="toolbar" suppressHydrationWarning>
         <span className="label">Symbol：</span>
-        <select className="select" value={symbol} onChange={e=>setSymbol(e.target.value)}>
-          <option value="2330.TW">2330.TW</option>
-          <option value="AAPL">AAPL</option>
-        </select>
+        <div className="dropdown" ref={symbolMenuRef}>
+          <button className="selectbox" onClick={()=>setSymbolOpen(v=>!v)}>{symbol || '選擇代碼'}</button>
+          {symbolOpen && (
+            <div className="menu" role="menu">
+              {symbols.length === 0 && <div className="menu-item">尚無代碼</div>}
+              {symbols.map(s => (
+                <div className="menu-item" key={s}>
+                  <button
+                    type="button"
+                    className="menu-choose"
+                    onMouseDown={(e)=>{ e.preventDefault(); e.stopPropagation(); setSymbol(s); setSymbolOpen(false); }}
+                  >{s}</button>
+                  <button
+                    type="button"
+                    className="menu-del"
+                    onMouseDown={(e)=>{ e.preventDefault(); e.stopPropagation(); const next = symbols.filter(x=>x!==s); setSymbols(next); if (symbol === s) setSymbol(next[0] || ''); }}
+                  >x</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <input
+          className="input"
+          placeholder="新增代碼，如 AAPL / 2330.TW"
+          value={newSym}
+          onChange={e=>setNewSym(e.target.value)}
+          onKeyDown={e=>{ if(e.key==='Enter'){ const v=newSym.trim(); if(v && !symbols.includes(v)){ setSymbols([v, ...symbols].slice(0,50)); setNewSym(''); } }}}
+          aria-label="新增代碼"
+        />
+        <button className="btn" onClick={()=>{ const v=newSym.trim(); if(v && !symbols.includes(v)){ setSymbols([v, ...symbols].slice(0,50)); setNewSym(''); } }}>加入</button>
         <span className="label">時間尺度：</span>
-        <select className="select" value={tf} onChange={e=>setTf(e.target.value as any)}>
-          <option value="5m">5 分鐘</option>
-          <option value="15m">15 分鐘</option>
-          <option value="1h">1 小時</option>
-          <option value="1d">1 天</option>
-        </select>
+        <div className="dropdown" ref={tfMenuRef}>
+          <button className="selectbox" onClick={()=>setTfOpen(v=>!v)}>{tfLabels[tf] || tf}</button>
+          {tfOpen && (
+            <div className="menu" role="menu">
+              {(['5m','15m','1h','1d'] as const).map(v => (
+                <div className="menu-item" key={v}>
+                  <button
+                    type="button"
+                    className="menu-choose"
+                    onMouseDown={(e)=>{ e.preventDefault(); e.stopPropagation(); setTf(v); setTfOpen(false); }}
+                  >{tfLabels[v]}</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
         <button className="btn btn-primary"
           disabled={loading}
           onClick={()=>{
             setError(null);
+            if (!symbol.trim()) { alert('請先選擇或新增代碼'); return; }
             setLoading(true);
             fetchOhlcv(symbol, tf)
               .then(d=>{ seriesRef.current?.setData(d); chartRef.current?.timeScale().fitContent(); })
@@ -218,8 +326,10 @@ export default function HomePage() {
           {loading ? '載入中…' : '載入'}
         </button>
         <button className="btn" onClick={onFindSimilar}>找相似</button>
+        <button className="btn" onClick={onDetectPattern}>辨識型態</button>
         <span className="tip">小技巧：在圖上點兩下依序選取「起點」與「終點」，再按「找相似」</span>
       </div>
+      {/* custom dropdown handles deletion; chips removed */}
       <div className="card" suppressHydrationWarning>
         <div ref={containerRef} className="chart" suppressHydrationWarning />
       </div>

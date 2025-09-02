@@ -16,6 +16,7 @@ from .tasks import enqueue_backtest
 import httpx
 import math
 from datetime import datetime, timezone
+from typing import Tuple
 
 Base.metadata.create_all(bind=engine)
 
@@ -376,14 +377,23 @@ def similar(req: SimilarSearchRequest, db: Session | None = Depends(get_db_safe)
         q_end_ts = qdf.index[-1]
 
     results = []
-    # Prefer DB symbol list; if empty, compare within the same symbol only
+    # Build candidate universe
+    req_codes = []
+    if getattr(req, 'universe', None):
+        try:
+            req_codes = [str(c).strip() for c in req.universe if str(c).strip()]
+        except Exception:
+            req_codes = []
     db_symbols = []
-    if db is not None:
+    if not req_codes and db is not None:
         try:
             db_symbols = db.query(Symbol).all()
         except Exception:
             db_symbols = []
-    codes = [s.code for s in db_symbols] if db_symbols else [req.symbol]
+    codes = req_codes or ([s.code for s in db_symbols] if db_symbols else [req.symbol])
+    # Deduplicate and cap size to avoid rate limiting
+    seen = set()
+    codes = [c for c in codes if not (c in seen or seen.add(c))][:50]
     for code in codes:
         if db_symbols:
             s = next((x for x in db_symbols if x.code == code), None)
@@ -436,6 +446,186 @@ def similar(req: SimilarSearchRequest, db: Session | None = Depends(get_db_safe)
             })
     results.sort(key=lambda x: x["distance"])
     return {"items": results[:req.top]}
+
+# --- Pattern classification (triangles) ---
+def _yahoo_ohlc_df(symbol: str, interval: str = "1d", y_range: str = "5y") -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; FinLabBot/1.0)", "Accept": "application/json"}
+    params = {"interval": interval, "range": y_range, "includePrePost": "false", "events": "div,splits"}
+    with httpx.Client(timeout=httpx.Timeout(10.0, read=20.0)) as client:
+        r = client.get(url, params=params, headers=headers)
+        r.raise_for_status()
+        j = r.json()
+    result = ((j or {}).get("chart") or {}).get("result") or []
+    if not result:
+        raise HTTPException(502, "upstream returned no data")
+    res = result[0]
+    ts = res.get("timestamp") or []
+    ind = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+    open_a = ind.get("open") or []
+    high_a = ind.get("high") or []
+    low_a  = ind.get("low") or []
+    close_a= ind.get("close") or []
+    rows = []
+    n = min(len(ts), len(open_a), len(high_a), len(low_a), len(close_a))
+    for i in range(n):
+        o, h, l, c = open_a[i], high_a[i], low_a[i], close_a[i]
+        if any(v is None for v in (o,h,l,c)):
+            continue
+        o = float(o); h = float(h); l = float(l); c = float(c)
+        if not all(math.isfinite(x) for x in (o,h,l,c)):
+            continue
+        rows.append({
+            "ts": datetime.fromtimestamp(ts[i], tz=timezone.utc),
+            "open": o, "high": h, "low": l, "close": c,
+        })
+    if not rows:
+        return pd.DataFrame(columns=["ts","open","high","low","close"]).set_index("ts")
+    df = pd.DataFrame(rows).sort_values("ts").set_index("ts")
+    return df
+
+def _linreg(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float]:
+    """Return slope, intercept, r2."""
+    if len(x) < 2:
+        return 0.0, 0.0, 0.0
+    A = np.vstack([x, np.ones_like(x)]).T
+    s, b = np.linalg.lstsq(A, y, rcond=None)[0]
+    yhat = s*x + b
+    ss_res = np.sum((y - yhat)**2)
+    ss_tot = np.sum((y - y.mean())**2) + 1e-12
+    r2 = 1 - ss_res/ss_tot
+    return float(s), float(b), float(max(0.0, min(1.0, r2)))
+
+def _find_peaks_troughs(df: pd.DataFrame, w: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+    h = df["high"].values
+    l = df["low"].values
+    n = len(df)
+    peaks = []
+    troughs = []
+    for i in range(w, n-w):
+        if h[i] == max(h[i-w:i+w+1]):
+            peaks.append(i)
+        if l[i] == min(l[i-w:i+w+1]):
+            troughs.append(i)
+    return np.array(peaks), np.array(troughs)
+
+def _detect_triangle(df: pd.DataFrame) -> Tuple[str, float, dict]:
+    # Require minimum bars
+    if len(df) < 20:
+        return "unknown", 0.0, {"reason":"too_few_bars"}
+    peaks, troughs = _find_peaks_troughs(df, w=2)
+    n = len(df)
+    price_scale = float(np.median(df["close"].values)) or 1.0
+
+    method = "extrema"
+    if len(peaks) < 3 or len(troughs) < 3:
+        # Fallback: quantile-based envelope regression to always get lines
+        method = "quantile"
+        h = df["high"].values
+        l = df["low"].values
+        qh = np.quantile(h, 0.8) if n >= 5 else max(h)
+        ql = np.quantile(l, 0.2) if n >= 5 else min(l)
+        p_idx = np.where(h >= qh)[0]
+        t_idx = np.where(l <= ql)[0]
+        if len(p_idx) < 3:
+            p_idx = np.argsort(h)[-min(3, n):]
+        if len(t_idx) < 3:
+            t_idx = np.argsort(l)[:min(3, n)]
+    else:
+        # Use last K extrema for lines
+        K = 6
+        p_idx = peaks[-K:]
+        t_idx = troughs[-K:]
+
+    # Normalize x over [0,1] so slope represents total change over window
+    xh = (p_idx.astype(float)) / max(1.0, (n - 1))
+    xl = (t_idx.astype(float)) / max(1.0, (n - 1))
+    yh = df["high"].values[p_idx]
+    yl = df["low"].values[t_idx]
+    sh, bh, r2h = _linreg(xh, yh)
+    sl, bl, r2l = _linreg(xl, yl)
+    nsh = sh / price_scale
+    nsl = sl / price_scale
+    # Range contraction
+    wlen = max(10, int(len(df)*0.3))
+    rng_start = float(df["high"].iloc[:wlen].max() - df["low"].iloc[:wlen].min())
+    rng_end   = float(df["high"].iloc[-wlen:].max() - df["low"].iloc[-wlen:].min())
+    contraction = rng_end / (rng_start + 1e-9)
+    # Heuristics with soft confidence scoring
+    # Thresholds tuned for normalized x in [0,1]
+    s_flat = 1.5e-3   # ~0.15% considered flat
+    s_min  = 3.5e-3   # ~0.35% considered meaningful slope
+
+    def pos_sig(x: float, k: float = 1.0) -> float:
+        x = max(0.0, x)
+        return float(np.tanh((x / max(1e-9, s_min)) * k))
+
+    def flat_sig(x: float, k: float = 1.0) -> float:
+        return float(1.0 - np.tanh((abs(x) / max(1e-9, s_flat)) * k))
+
+    contraction_conf = float(max(0.0, min(1.0, 1.0 - contraction)))
+    fit_conf = float(max(0.0, min(1.0, (r2h + r2l) / 2.0)))
+
+    sym_conf = float(np.mean([
+        pos_sig(-nsh),
+        pos_sig(nsl),
+        fit_conf,
+        contraction_conf,
+    ]))
+    asc_conf = float(np.mean([
+        flat_sig(nsh),
+        pos_sig(nsl),
+        fit_conf,
+        contraction_conf,
+    ]))
+    desc_conf = float(np.mean([
+        flat_sig(nsl),
+        pos_sig(-nsh),
+        fit_conf,
+        contraction_conf,
+    ]))
+
+    conf_map = {"sym_triangle": sym_conf, "asc_triangle": asc_conf, "desc_triangle": desc_conf}
+    label = max(conf_map, key=conf_map.get)
+    conf = conf_map[label]
+    if conf < 0.25:
+        label, conf = "unknown", 0.0
+    meta = {
+        "slope_high": nsh, "slope_low": nsl,
+        "r2_high": r2h, "r2_low": r2l,
+        "contraction": contraction,
+        "peaks": len(peaks), "troughs": len(troughs),
+        "method": method,
+        "fit_conf": fit_conf,
+        "contraction_conf": contraction_conf,
+        "sym_conf": sym_conf,
+        "asc_conf": asc_conf,
+        "desc_conf": desc_conf,
+    }
+    return label, conf, meta
+
+class PatternRequest(BaseModel):
+    symbol: str
+    start: str
+    end: str
+    tf: str = "1d"
+
+@app.post("/pattern/classify")
+def pattern_classify(req: PatternRequest):
+    # Fetch daily OHLC between start/end (from Yahoo)
+    try:
+        full = _yahoo_ohlc_df(req.symbol, interval="1d", y_range="10y")
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"upstream fetch failed: {e}")
+    if full.empty:
+        raise HTTPException(400, "no data")
+    start_utc = pd.to_datetime(req.start, utc=True)
+    end_utc = pd.to_datetime(req.end, utc=True)
+    df = full[(full.index >= start_utc) & (full.index <= end_utc)]
+    if len(df) < 20:
+        raise HTTPException(400, "window too short (min 20 bars)")
+    label, conf, meta = _detect_triangle(df)
+    return {"symbol": req.symbol, "start": req.start, "end": req.end, "label": label, "confidence": conf, "meta": meta}
 
 @app.post("/backtest/submit")
 def backtest_submit(req: BacktestSubmitRequest, db: Session = Depends(get_db)):

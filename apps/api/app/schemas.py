@@ -12,6 +12,7 @@ class SimilarSearchRequest(BaseModel):
     end: str
     m: int = 30
     top: int = 10
+    universe: Optional[List[str]] = None
 
 class BacktestConfig(BaseModel):
     symbol: str

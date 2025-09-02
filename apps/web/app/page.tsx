@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { createChart, ISeriesApi, UTCTimestamp } from 'lightweight-charts';
+import { createChart, ISeriesApi, UTCTimestamp, ColorType } from 'lightweight-charts';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -57,8 +57,18 @@ export default function HomePage() {
 
   useEffect(() => {
     if (!containerRef.current) return;
-    const chart = createChart(containerRef.current, { height: 420 });
-    const series = chart.addCandlestickSeries();
+    const chart = createChart(containerRef.current, {
+      height: 460,
+      layout: { background: { type: ColorType.Solid, color: 'transparent' }, textColor: '#334155' },
+      grid: { vertLines: { color: '#e2e8f0' }, horzLines: { color: '#e2e8f0' } },
+      rightPriceScale: { borderColor: '#cbd5e1' },
+      timeScale: { borderColor: '#cbd5e1' },
+    });
+    const series = chart.addCandlestickSeries({
+      upColor: '#16a34a', downColor: '#ef4444',
+      wickUpColor: '#16a34a', wickDownColor: '#ef4444',
+      borderUpColor: '#16a34a', borderDownColor: '#ef4444',
+    });
     chartRef.current = chart;
     seriesRef.current = series;
 
@@ -177,22 +187,24 @@ export default function HomePage() {
   };
 
   return (
-    <main style={{ padding: 20 }}>
-      <h1 style={{ fontSize: 22, fontWeight: 700 }}>FinLab Starter (Fixed)</h1>
-      <div style={{ display:'flex', gap: 8, alignItems:'center', marginBottom: 12 }}>
-        <label>Symbol：</label>
-        <select value={symbol} onChange={e=>setSymbol(e.target.value)}>
+    <main className="app" suppressHydrationWarning>
+      <div className="header" suppressHydrationWarning>
+        <h1 className="title">FinLab Starter</h1>
+      </div>
+      <div className="toolbar" suppressHydrationWarning>
+        <span className="label">Symbol：</span>
+        <select className="select" value={symbol} onChange={e=>setSymbol(e.target.value)}>
           <option value="2330.TW">2330.TW</option>
           <option value="AAPL">AAPL</option>
         </select>
-        <label style={{marginLeft:8}}>時間尺度：</label>
-        <select value={tf} onChange={e=>setTf(e.target.value as any)}>
+        <span className="label">時間尺度：</span>
+        <select className="select" value={tf} onChange={e=>setTf(e.target.value as any)}>
           <option value="5m">5 分鐘</option>
           <option value="15m">15 分鐘</option>
           <option value="1h">1 小時</option>
           <option value="1d">1 天</option>
         </select>
-        <button
+        <button className="btn btn-primary"
           disabled={loading}
           onClick={()=>{
             setError(null);
@@ -205,18 +217,16 @@ export default function HomePage() {
         >
           {loading ? '載入中…' : '載入'}
         </button>
-        <button onClick={onFindSimilar}>找相似</button>
-        <span style={{marginLeft:12, opacity:0.7}}>
-          小技巧：在圖上點兩下依序選取「起點」與「終點」，再按「找相似」
-        </span>
+        <button className="btn" onClick={onFindSimilar}>找相似</button>
+        <span className="tip">小技巧：在圖上點兩下依序選取「起點」與「終點」，再按「找相似」</span>
       </div>
-      <div ref={containerRef} style={{ width:'100%', height: 420, border:'1px solid #e5e7eb', borderRadius:8 }} />
+      <div className="card" suppressHydrationWarning>
+        <div ref={containerRef} className="chart" suppressHydrationWarning />
+      </div>
       {error && (
-        <div style={{marginTop:10, padding:10, background:'#fff7ed', color:'#9a3412', border:'1px solid #fdba74', borderRadius:6}}>
-          錯誤：{error}
-        </div>
+        <div className="alert" suppressHydrationWarning>錯誤：{error}</div>
       )}
-      <div style={{marginTop:10, fontSize:12, opacity:0.7}}>
+      <div className="info" suppressHydrationWarning>
         API：{API}　|　TF：{tf}　|　範圍：{rangeLabel || '—'}　|　選取區間：{range.start || '—'} ~ {range.end || '—'}
       </div>
     </main>

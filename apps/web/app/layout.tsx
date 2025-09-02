@@ -1,3 +1,4 @@
+import './globals.css';
 export const metadata = { title: 'FinLab Starter', description: 'Next.js + FastAPI' };
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (

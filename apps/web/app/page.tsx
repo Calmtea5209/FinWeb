@@ -28,6 +28,10 @@ export default function HomePage() {
   const [tfOpen, setTfOpen] = useState(false);
   const tfMenuRef = useRef<HTMLDivElement | null>(null);
   const tfLabels: Record<string,string> = { '5m':'5 分鐘', '15m':'15 分鐘', '1h':'1 小時', '1d':'1 天' };
+  const [sentSym, setSentSym] = useState<{label:string; score:number; rsi14:number; slope_norm:number; vol:number} | null>(null);
+  const [sentEnv, setSentEnv] = useState<{label:string; pct_above_ma50:number; pct_above_ma20:number; avg_rsi:number; universe_size:number} | null>(null);
+  const [newsSym, setNewsSym] = useState<Array<{title:string; url:string; publisher?:string; published_at?:string}>>([]);
+  const [newsMkt, setNewsMkt] = useState<Array<{title:string; url:string; publisher?:string; published_at?:string}>>([]);
 
   const fetchOhlcv = async (sym: string, timeframe: string) => {
     // Choose sensible default ranges per timeframe to avoid short windows
@@ -159,6 +163,52 @@ export default function HomePage() {
 
   // Live data: no DB meta; clear any previous state
   useEffect(() => { setMinStepSec(null); }, [symbol]);
+
+  // Fetch sentiment when symbol or universe changes (daily-based)
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      if (!symbol.trim()) { setSentSym(null); setSentEnv(null); return; }
+      try {
+        const r = await fetch('/api/sentiment/summary', {
+          method: 'POST', headers: { 'Content-Type':'application/json' },
+          body: JSON.stringify({ symbol, universe: symbols })
+        });
+        if (!r.ok) return;
+        const j = await r.json();
+        if (cancelled) return;
+        setSentSym({
+          label: j.symbol_sentiment?.label,
+          score: j.symbol_sentiment?.score ?? 0,
+          rsi14: j.symbol_sentiment?.rsi14 ?? 0,
+          slope_norm: j.symbol_sentiment?.slope_norm ?? 0,
+          vol: j.symbol_sentiment?.vol ?? 0,
+        });
+        setSentEnv({
+          label: j.environment_sentiment?.label,
+          pct_above_ma50: j.environment_sentiment?.pct_above_ma50 ?? 0,
+          pct_above_ma20: j.environment_sentiment?.pct_above_ma20 ?? 0,
+          avg_rsi: j.environment_sentiment?.avg_rsi ?? 0,
+          universe_size: j.environment_sentiment?.universe_size ?? symbols.length,
+        });
+      } catch {}
+      try {
+        const r2 = await fetch('/api/news/summary', {
+          method: 'POST', headers: { 'Content-Type':'application/json' },
+          body: JSON.stringify({ symbol, universe: symbols })
+        });
+        if (r2.ok) {
+          const j2 = await r2.json();
+          if (!cancelled) {
+            setNewsSym(Array.isArray(j2.symbol_news) ? j2.symbol_news : []);
+            setNewsMkt(Array.isArray(j2.market_news) ? j2.market_news : []);
+          }
+        }
+      } catch {}
+    };
+    run();
+    return () => { cancelled = true; };
+  }, [symbol, symbols]);
 
   // Auto refresh to keep latest candle updated
   const refreshMs = useMemo(() => {
@@ -338,6 +388,59 @@ export default function HomePage() {
       )}
       <div className="info" suppressHydrationWarning>
         API：{API}　|　TF：{tf}　|　範圍：{rangeLabel || '—'}　|　選取區間：{range.start || '—'} ~ {range.end || '—'}
+      </div>
+      <div className="sentiment">
+        <div className="sent-card">
+          <div className="sent-title">個股情緒</div>
+          <div className="sent-metrics">
+            <div className="sent-kv"><span>狀態</span><span className="badge">{sentSym?.label || '—'}</span></div>
+            <div className="sent-kv"><span>分數</span><span>{sentSym ? Math.round(sentSym.score*100) : '—'}%</span></div>
+            <div className="sent-kv"><span>RSI(14)</span><span>{sentSym ? sentSym.rsi14.toFixed(1) : '—'}</span></div>
+            <div className="sent-kv"><span>趨勢斜率</span><span>{sentSym ? sentSym.slope_norm.toFixed(4) : '—'}</span></div>
+            <div className="sent-kv"><span>波動率(近60)</span><span>{sentSym ? (sentSym.vol*100).toFixed(2) : '—'}%</span></div>
+          </div>
+        </div>
+        <div className="sent-card">
+          <div className="sent-title">環境情緒</div>
+          <div className="sent-metrics">
+            <div className="sent-kv"><span>狀態</span><span className="badge">{sentEnv?.label || '—'}</span></div>
+            <div className="sent-kv"><span>樣本數</span><span>{sentEnv?.universe_size ?? 0}</span></div>
+            <div className="sent-kv"><span>MA50 之上</span><span>{sentEnv ? Math.round(sentEnv.pct_above_ma50*100) : '—'}%</span></div>
+            <div className="sent-kv"><span>MA20 之上</span><span>{sentEnv ? Math.round(sentEnv.pct_above_ma20*100) : '—'}%</span></div>
+            <div className="sent-kv"><span>平均 RSI</span><span>{sentEnv ? sentEnv.avg_rsi.toFixed(1) : '—'}</span></div>
+          </div>
+        </div>
+      </div>
+      <div className="news-card">
+        <div className="news-title">新聞快照</div>
+        <div className="news-grid">
+          <div>
+            <div className="sent-title">個股相關</div>
+            <ul className="news-list">
+              {newsSym.length === 0 && <li className="news-item">—</li>}
+              {newsSym.slice(0,6).map((n,i) => (
+                <li key={i} className="news-item">
+                  <a href={n.url} target="_blank" rel="noopener noreferrer">{n.title}</a>
+                  {n.publisher && <span style={{marginLeft:6, color:'#64748b'}}>· {n.publisher}</span>}
+                  {n.published_at && <span style={{marginLeft:6, color:'#94a3b8'}}>· {new Date(n.published_at).toLocaleString('zh-TW', { hour12:false })}</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div>
+            <div className="sent-title">大環境</div>
+            <ul className="news-list">
+              {newsMkt.length === 0 && <li className="news-item">—</li>}
+              {newsMkt.slice(0,6).map((n,i) => (
+                <li key={i} className="news-item">
+                  <a href={n.url} target="_blank" rel="noopener noreferrer">{n.title}</a>
+                  {n.publisher && <span style={{marginLeft:6, color:'#64748b'}}>· {n.publisher}</span>}
+                  {n.published_at && <span style={{marginLeft:6, color:'#94a3b8'}}>· {new Date(n.published_at).toLocaleString('zh-TW', { hour12:false })}</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
       </div>
     </main>
   );

@@ -16,7 +16,9 @@ from .tasks import enqueue_backtest
 import httpx
 import math
 from datetime import datetime, timezone
-from typing import Tuple
+from typing import Tuple, List, Optional
+import re
+from urllib.parse import urlparse
 
 Base.metadata.create_all(bind=engine)
 
@@ -626,6 +628,443 @@ def pattern_classify(req: PatternRequest):
         raise HTTPException(400, "window too short (min 20 bars)")
     label, conf, meta = _detect_triangle(df)
     return {"symbol": req.symbol, "start": req.start, "end": req.end, "label": label, "confidence": conf, "meta": meta}
+
+# --- Sentiment summary ---
+def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
+    s = series.astype(float)
+    delta = s.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.ewm(alpha=1/n, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/n, adjust=False).mean() + 1e-12
+    rs = roll_up / roll_down
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+class SentimentRequest(BaseModel):
+    symbol: str
+    universe: Optional[List[str]] = None
+
+@app.post("/sentiment/summary")
+def sentiment_summary(req: SentimentRequest):
+    # Individual symbol sentiment (daily, 6 months)
+    sym = req.symbol
+    try:
+        df = _yahoo_ohlc_df(sym, interval="1d", y_range="6mo")
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"upstream fetch failed: {e}")
+    if df.empty:
+        raise HTTPException(400, "no data")
+    close = df["close"].astype(float)
+    ret = close.pct_change().dropna()
+    rsi14 = _rsi(close, 14).iloc[-1]
+    # 60-bar normalized slope on log price
+    last = close.tail(min(60, len(close)))
+    x = (pd.RangeIndex(len(last)).values.astype(float))
+    x = (x - x.min()) / max(1.0, (x.max() - x.min()))
+    y = np.log(last.values)
+    s, b = np.linalg.lstsq(np.vstack([x, np.ones_like(x)]).T, y, rcond=None)[0]
+    slope_norm = float(s)
+    vol = float(ret.tail(min(60, len(ret))).std())
+    # score 0..1 from RSI and slope
+    score = float(np.clip(0.5*(rsi14/100.0) + 0.5*(np.tanh(slope_norm*8)+1)/2, 0, 1))
+    if score >= 0.7:
+        sym_label = "極度偏多"
+    elif score >= 0.55:
+        sym_label = "偏多"
+    elif score <= 0.3:
+        sym_label = "極度偏空"
+    elif score <= 0.45:
+        sym_label = "偏空"
+    else:
+        sym_label = "中性"
+
+    # Environment sentiment across a small universe
+    universe = req.universe or [sym]
+    # dedupe and cap to avoid rate limits
+    uniq = []
+    for c in universe:
+        c = str(c).strip()
+        if c and c not in uniq:
+            uniq.append(c)
+        if len(uniq) >= 15:
+            break
+    breadth_ma50_cnt = 0
+    breadth_ma20_cnt = 0
+    rsi_vals = []
+    total = 0
+    for code in uniq:
+        try:
+            d = _yahoo_ohlc_df(code, interval="1d", y_range="6mo")
+        except httpx.HTTPError:
+            continue
+        if d.empty or len(d) < 30:
+            continue
+        c = d["close"].astype(float)
+        ma50 = c.rolling(50, min_periods=1).mean()
+        ma20 = c.rolling(20, min_periods=1).mean()
+        if c.iloc[-1] > ma50.iloc[-1]:
+            breadth_ma50_cnt += 1
+        if c.iloc[-1] > ma20.iloc[-1]:
+            breadth_ma20_cnt += 1
+        rsi_vals.append(float(_rsi(c, 14).iloc[-1]))
+        total += 1
+    pct_ma50 = float(breadth_ma50_cnt / total) if total else 0.0
+    pct_ma20 = float(breadth_ma20_cnt / total) if total else 0.0
+    avg_rsi = float(np.mean(rsi_vals)) if rsi_vals else 0.0
+    if pct_ma50 > 0.6 and avg_rsi > 55:
+        env_label = "Risk-On"
+    elif pct_ma50 < 0.4 and avg_rsi < 45:
+        env_label = "Risk-Off"
+    else:
+        env_label = "中性"
+
+    return {
+        "symbol": sym,
+        "symbol_sentiment": {
+            "rsi14": float(rsi14),
+            "slope_norm": slope_norm,
+            "vol": vol,
+            "score": score,
+            "label": sym_label,
+        },
+        "environment_sentiment": {
+            "universe_size": total,
+            "pct_above_ma50": pct_ma50,
+            "pct_above_ma20": pct_ma20,
+            "avg_rsi": avg_rsi,
+            "label": env_label,
+        }
+    }
+
+# --- News summary ---
+class NewsRequest(BaseModel):
+    symbol: str
+    universe: Optional[List[str]] = None
+
+def _yahoo_quote_name(symbol: str) -> Optional[str]:
+    url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; FinLabBot/1.0)", "Accept": "application/json"}
+    try:
+        with httpx.Client(timeout=httpx.Timeout(6.0, read=8.0)) as client:
+            r = client.get(url, params={"symbols": symbol}, headers=headers)
+            r.raise_for_status()
+            j = r.json()
+        result = ((j or {}).get("quoteResponse") or {}).get("result") or []
+        if not result:
+            return None
+        q = result[0]
+        name = q.get("shortName") or q.get("longName") or q.get("displayName")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    except Exception:
+        return None
+    return None
+
+def _yahoo_news_search(query: str, news_count: int = 6, lang: str = "en-US", region: str = "US", *, require_keywords: Optional[List[str]] = None) -> List[dict]:
+    base_urls = [
+        "https://query1.finance.yahoo.com/v1/finance/search",
+        "https://query2.finance.yahoo.com/v1/finance/search",
+    ]
+    params = {
+        "q": query,
+        "newsCount": str(int(news_count)),
+        "quotesCount": "0",
+        "lang": lang,
+        "region": region,
+    }
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; FinLabBot/1.0)", "Accept": "application/json"}
+    last_err = None
+    for url in base_urls:
+        try:
+            with httpx.Client(timeout=httpx.Timeout(8.0, read=12.0)) as client:
+                r = client.get(url, params=params, headers=headers)
+                r.raise_for_status()
+                j = r.json()
+                news = (j or {}).get("news") or []
+                out = []
+                for n in news:
+                    title = n.get("title")
+                    link = n.get("link") or n.get("linkUrl")
+                    pub = n.get("publisher") or n.get("provider")
+                    ts = n.get("pubDate") or n.get("published_at")
+                    summ = n.get("summary") or n.get("body") or ""
+                    text_blob = " ".join([str(x) for x in [title, summ, pub] if x])
+                    if require_keywords:
+                        hit = False
+                        t = text_blob.lower()
+                        for kw in require_keywords:
+                            if not kw:
+                                continue
+                            if kw.lower() in t:
+                                hit = True
+                                break
+                        if not hit:
+                            continue
+                    # Yahoo returns millis
+                    if isinstance(ts, (int, float)):
+                        dt = datetime.fromtimestamp(float(ts)/1000.0, tz=timezone.utc).isoformat()
+                    else:
+                        dt = None
+                    if title and link:
+                        out.append({"title": title, "url": link, "publisher": pub, "published_at": dt})
+                if out:
+                    return out[:news_count]
+        except Exception as e:
+            last_err = e
+            continue
+    # If all fail, return empty list
+    return []
+
+def _gdelt_news_search(
+    query: str,
+    news_count: int = 8,
+    *,
+    lang_hint: str = "english",
+    require_keywords: Optional[List[str]] = None,
+    timespan: str = "14d",
+    exclude_domains: Optional[List[str]] = None,
+    country_hint: Optional[str] = None,
+) -> List[dict]:
+    """Query GDELT Doc API for recent articles.
+    lang_hint: 'english' or 'chinese' (case-insensitive) → used in sourcelang filter.
+    timespan: like '7d','14d','30d'.
+    country_hint: optional sourcecountry code like 'TW' to prioritize local language sources.
+    """
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    # Normalize language token for sourcelang (lowercase required by GDELT)
+    lang_token = None
+    if lang_hint:
+        if lang_hint.lower().startswith("zh") or lang_hint.lower().startswith("chi") or lang_hint.lower()=="chinese":
+            lang_token = "chinese"
+        elif lang_hint.lower()=="english" or lang_hint.lower().startswith("en"):
+            lang_token = "english"
+    lang_filter = f" sourcelang:{lang_token}" if lang_token else ""
+    country_filter = f" sourcecountry:{country_hint}" if country_hint else ""
+
+    q = f"({query}){lang_filter}{country_filter}"
+    params = {
+        "query": q,
+        "format": "json",
+        "timespan": timespan,
+        "sort": "DateDesc",
+        "maxrecords": str(news_count * 10),  # fetch extra, we'll filter
+    }
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; FinLabBot/1.0)", "Accept": "application/json"}
+    try:
+        with httpx.Client(timeout=httpx.Timeout(10.0, read=15.0)) as client:
+            r = client.get(url, params=params, headers=headers)
+            r.raise_for_status()
+            j = r.json()
+    except Exception:
+        return []
+    arts = (j or {}).get("articles") or []
+    out: List[dict] = []
+    for a in arts:
+        title = a.get("title")
+        link = a.get("url")
+        pub = a.get("sourceCommonName") or a.get("domain") or a.get("sourcecountry")
+        ts = a.get("seendate") or a.get("publishdate")
+        text_blob = " ".join([str(x) for x in [title, pub, a.get("url") ] if x])
+        if require_keywords:
+            t = text_blob.lower()
+            if not any((kw and kw.lower() in t) for kw in require_keywords):
+                continue
+        if exclude_domains and link:
+            try:
+                host = urlparse(link).netloc.lower()
+                if any(dom in host for dom in exclude_domains):
+                    continue
+            except Exception:
+                pass
+        # GDELT seendate often like '20240902130500' or ISO
+        dt = None
+        if isinstance(ts, str):
+            try:
+                if "T" in ts:
+                    # assume ISO
+                    dt = ts if ts.endswith("Z") else datetime.fromisoformat(ts).astimezone(timezone.utc).isoformat()
+                else:
+                    dt = datetime.strptime(ts, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).isoformat()
+            except Exception:
+                dt = None
+        if title and link:
+            out.append({"title": title, "url": link, "publisher": pub, "published_at": dt})
+    return out[:news_count]
+
+@app.post("/news/summary")
+def news_summary(req: NewsRequest):
+    sym = req.symbol
+    # Pick market query based on symbol suffix
+    market_query = "stock market"
+    lang = "en-US"; region = "US"
+    if sym.upper().endswith(".TW"):
+        market_query = "台股 OR 臺股 OR 台灣 股市"
+        lang = "zh-TW"; region = "TW"
+    # Build a richer query for the symbol to improve relevance
+    sym_name = _yahoo_quote_name(sym)
+    no_suf = sym.split(".")[0] if "." in sym else sym
+    q_parts = [sym]
+    if sym_name:
+        q_parts.append(f'"{sym_name}"')
+    if no_suf and no_suf != sym:
+        q_parts.append(no_suf)
+    sym_query = " OR ".join(q_parts + ["shares", "stock"]) if lang.startswith("en") else " OR ".join(q_parts)
+    # Build strict keyword filters to ensure relevance
+    keywords = [sym.lower()]
+    if no_suf:
+        keywords.append(no_suf.lower())
+    if sym_name:
+        keywords.extend([sym_name.lower()])
+        # split words for English names
+        keywords.extend([w.lower() for w in re.split(r"\W+", sym_name) if len(w) > 2])
+    # Chinese helpers
+    if sym.upper().endswith('.TW'):
+        keywords.extend(['股價','股票','公司','台積','台股','臺股'])
+
+    # Prefer GDELT; query both English/Chinese for TW市場
+    is_tw = sym.upper().endswith(".TW")
+    exclude = ["yahoo.com", "finance.yahoo.com", "news.yahoo.com", "tw.news.yahoo.com", "tw.stock.yahoo.com"]
+
+    def dedupe(items: List[dict]) -> List[dict]:
+        seen = set()
+        out = []
+        for it in items:
+            u = (it.get("url") or "").strip()
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            out.append(it)
+        return out
+
+    sym_list: List[dict] = []
+    mkt_list: List[dict] = []
+
+    # Try OpenBB first if available
+    if os.getenv("NEWS_PROVIDER", "openbb").lower() == "openbb":
+        sym_list = _openbb_news_search(sym) or []
+        # market query via search
+        mkt_list = _openbb_news_search(market_query) or []
+
+    # Then try GDELT English (priority)
+    sym_list += _gdelt_news_search(
+        sym_query, news_count=8, lang_hint="english", require_keywords=keywords,
+        exclude_domains=exclude, timespan="30d", country_hint="US")
+    mkt_list += _gdelt_news_search(
+        market_query, news_count=6, lang_hint="english",
+        exclude_domains=exclude, timespan="30d", country_hint="US")
+    # Try GDELT Chinese for TW
+    if is_tw:
+        sym_list += _gdelt_news_search(
+            sym_query, news_count=8, lang_hint="chinese", require_keywords=keywords,
+            exclude_domains=exclude, timespan="30d", country_hint="TW")
+        mkt_list += _gdelt_news_search(
+            market_query, news_count=6, lang_hint="chinese",
+            exclude_domains=exclude, timespan="30d", country_hint="TW")
+
+    sym_list = dedupe(sym_list)
+    mkt_list = dedupe(mkt_list)
+
+    # If still empty, relax filters progressively
+    if not sym_list:
+        # 1) GDELT without language filter (wider net)
+        sym_list += _gdelt_news_search(sym_query, news_count=8, lang_hint=None, timespan="60d")
+    if not mkt_list:
+        mkt_list += _gdelt_news_search(market_query, news_count=6, lang_hint=None, timespan="60d")
+
+    sym_list = dedupe(sym_list)
+    mkt_list = dedupe(mkt_list)
+
+    # Final safety fallback to Yahoo finance search if still nothing
+    if not sym_list:
+        sym_list = _yahoo_news_search(sym_query, news_count=8, lang=lang, region=region, require_keywords=keywords)
+    if not mkt_list:
+        mkt_list = _yahoo_news_search(market_query, news_count=6, lang=lang, region=region)
+
+    return {"symbol": sym, "symbol_news": sym_list[:8], "market_news": mkt_list[:6]}
+
+# --- OpenBB news (optional) ---
+def _openbb_news_search(query: str, limit: int = 8) -> List[dict]:
+    try:
+        try:
+            # OpenBB SDK v4
+            from openbb import ob as _ob
+        except Exception:
+            try:
+                from openbb import obb as _ob  # alt alias
+            except Exception:
+                _ob = None
+        if _ob is None:
+            return []
+
+        items = []
+        news_mod = getattr(_ob, "news", None)
+        tried = []
+        for method_name in ("search", "company", "query"):
+            if not news_mod or not hasattr(news_mod, method_name):
+                continue
+            func = getattr(news_mod, method_name)
+            try:
+                if method_name == "company":
+                    resp = func(symbol=query, limit=limit)
+                else:
+                    resp = func(query=query, limit=limit)
+            except Exception:
+                tried.append(method_name)
+                continue
+            # Normalize response
+            data = None
+            if resp is None:
+                continue
+            if hasattr(resp, "results"):
+                data = resp.results
+            elif hasattr(resp, "to_df"):
+                try:
+                    df = resp.to_df()
+                    data = df.to_dict(orient="records")
+                except Exception:
+                    data = None
+            elif isinstance(resp, dict) and "data" in resp:
+                data = resp["data"]
+            elif isinstance(resp, (list, tuple)):
+                data = resp
+            if not data:
+                continue
+            out: List[dict] = []
+            for it in data:
+                if isinstance(it, dict):
+                    title = it.get("title") or it.get("headline") or it.get("name")
+                    url = it.get("url") or it.get("link")
+                    src = it.get("source") or it.get("publisher")
+                    ts = it.get("published") or it.get("published_at") or it.get("date")
+                else:
+                    title = str(it)
+                    url = None
+                    src = None
+                    ts = None
+                if not title:
+                    continue
+                iso = None
+                if isinstance(ts, str):
+                    try:
+                        if "T" in ts:
+                            iso = ts if ts.endswith("Z") else datetime.fromisoformat(ts).astimezone(timezone.utc).isoformat()
+                        else:
+                            iso = datetime.fromisoformat(ts).astimezone(timezone.utc).isoformat()
+                    except Exception:
+                        iso = None
+                elif isinstance(ts, (int, float)):
+                    try:
+                        iso = datetime.fromtimestamp(float(ts)/1000.0, tz=timezone.utc).isoformat()
+                    except Exception:
+                        iso = None
+                out.append({"title": title, "url": url, "publisher": src, "published_at": iso})
+            if out:
+                return out[:limit]
+        return []
+    except Exception:
+        return []
+
 
 @app.post("/backtest/submit")
 def backtest_submit(req: BacktestSubmitRequest, db: Session = Depends(get_db)):

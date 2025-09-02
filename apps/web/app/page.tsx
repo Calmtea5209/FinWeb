@@ -11,6 +11,8 @@ export default function HomePage() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<ReturnType<typeof createChart> | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const highlightRef = useRef<HTMLDivElement | null>(null);
+  const dataRef = useRef<Array<{time:any; open:number; high:number; low:number; close:number}>>([]);
 
   const defaultSymbols = (process.env.NEXT_PUBLIC_SYMBOLS || '2330.TW,AAPL')
     .split(',').map(s=>s.trim()).filter(Boolean);
@@ -32,6 +34,13 @@ export default function HomePage() {
   const [sentEnv, setSentEnv] = useState<{label:string; pct_above_ma50:number; pct_above_ma20:number; avg_rsi:number; universe_size:number} | null>(null);
   const [newsSym, setNewsSym] = useState<Array<{title:string; url:string; publisher?:string; published_at?:string}>>([]);
   const [newsMkt, setNewsMkt] = useState<Array<{title:string; url:string; publisher?:string; published_at?:string}>>([]);
+  const [simOpen, setSimOpen] = useState(false);
+  const [simItems, setSimItems] = useState<any[]>([]);
+  const [simError, setSimError] = useState<string | null>(null);
+  const [simIndex, setSimIndex] = useState(0);
+  const simChartRef = useRef<ReturnType<typeof createChart> | null>(null);
+  const simSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const simContainerRef = useRef<HTMLDivElement | null>(null);
 
   const fetchOhlcv = async (sym: string, timeframe: string) => {
     // Choose sensible default ranges per timeframe to avoid short windows
@@ -39,7 +48,7 @@ export default function HomePage() {
     const rng = tfToRange[timeframe] || '5y';
     const params = new URLSearchParams({ symbol: sym, tf: timeframe, limit: String(2000) });
     params.set('rng', rng);
-    const url = `${API}/chart/ohlcv_live?${params.toString()}`;
+    const url = `/api/chart/ohlcv_live?${params.toString()}`;
     const r = await fetch(url, { cache: 'no-store', headers: { 'Accept': 'application/json' } });
     if (!r.ok) {
       const text = await r.text().catch(() => '');
@@ -68,6 +77,28 @@ export default function HomePage() {
     return data;
   };
 
+  // Fetch a daily slice for modal preview
+  const fetchDailySlice = async (sym: string, startIso: string, endIso: string) => {
+    const params = new URLSearchParams({ symbol: sym, tf: '1d', limit: String(2000) });
+    params.set('rng', '5y');
+    const url = `/api/chart/ohlcv_live?${params.toString()}`;
+    const r = await fetch(url, { cache: 'no-store', headers: { 'Accept': 'application/json' } });
+    if (!r.ok) throw new Error(`GET ${url} failed: HTTP ${r.status}`);
+    const j = await r.json();
+    const s = new Date(startIso).getTime();
+    const e = new Date(endIso).getTime();
+    const padMs = 1000 * 60 * 60 * 24 * 10; // +/- 10 days padding for context
+    const data = (j.items as Ohlcv[]).map(d => ({
+      time: (new Date(d.ts).getTime() / 1000) as UTCTimestamp,
+      open: d.open, high: d.high, low: d.low, close: d.close,
+    }))
+    .filter(bar => {
+      const t = (bar.time as number) * 1000;
+      return t >= (s - padMs) && t <= (e + padMs);
+    });
+    return data;
+  };
+
   useEffect(() => {
     if (!containerRef.current) return;
     const chart = createChart(containerRef.current, {
@@ -85,16 +116,18 @@ export default function HomePage() {
     chartRef.current = chart;
     seriesRef.current = series;
 
-    const resize = () => chart.applyOptions({ width: containerRef.current!.clientWidth });
+    const resize = () => { chart.applyOptions({ width: containerRef.current!.clientWidth }); updateHighlight(); };
     window.addEventListener('resize', resize);
 
     setError(null);
     if (symbol.trim()) {
-      fetchOhlcv(symbol, tf)
-        .then(data => {
-          series.setData(data);
-          chart.timeScale().fitContent();
-        })
+    fetchOhlcv(symbol, tf)
+      .then(data => {
+        series.setData(data);
+        dataRef.current = data as any;
+        chart.timeScale().fitContent();
+        updateHighlight();
+      })
         .catch((e: unknown) => {
           const msg = e instanceof Error ? e.message : String(e);
           setError(msg);
@@ -127,10 +160,31 @@ export default function HomePage() {
         const b = Math.max(t1, t2);
         const iso = (sec:number) => new Date(sec*1000).toISOString().slice(0,10);
         setRange({ start: iso(a), end: iso(b) });
+        updateHighlight({ start: iso(a), end: iso(b) });
       }
     });
 
-    return () => { window.removeEventListener('resize', resize); chart.remove(); };
+    // Build overlay for selected range
+    if (containerRef.current && !highlightRef.current) {
+      const ov = document.createElement('div');
+      ov.style.position = 'absolute';
+      // Let vertical bounds be computed dynamically
+      ov.style.top = '0';
+      ov.style.bottom = '0';
+      ov.style.left = '0';
+      ov.style.width = '0';
+      ov.style.background = 'rgba(37,99,235,0.10)';
+      ov.style.border = '1px solid rgba(37,99,235,0.45)';
+      ov.style.pointerEvents = 'none';
+      ov.style.display = 'none';
+      containerRef.current.appendChild(ov);
+      highlightRef.current = ov;
+    }
+
+    // Update on visible time range change (pan/zoom)
+    const unsub = chart.timeScale().subscribeVisibleTimeRangeChange(() => updateHighlight());
+
+    return () => { window.removeEventListener('resize', resize); unsub(); highlightRef.current?.remove(); highlightRef.current = null; chart.remove(); };
   }, []);
 
   // Load/save custom symbols list from localStorage
@@ -228,7 +282,7 @@ export default function HomePage() {
       setError(null);
       if (!symbol.trim()) return;
       fetchOhlcv(symbol, tf)
-        .then(d => { if (!cancelled) { seriesRef.current?.setData(d); /* do not refit on every refresh */ } })
+        .then(d => { if (!cancelled) { seriesRef.current?.setData(d); dataRef.current = d as any; updateHighlight(); /* do not refit on every refresh */ } })
         .catch((e: unknown)=>{
           if (cancelled) return;
           const msg = e instanceof Error ? e.message : String(e);
@@ -239,6 +293,116 @@ export default function HomePage() {
     const id = setInterval(tick, refreshMs);
     return () => { cancelled = true; clearInterval(id); };
   }, [symbol, tf, refreshMs]);
+
+  // Helper: convert ISO to Time based on tf
+  const isoToTime = (iso: string): any => {
+    const d = new Date(iso + 'T00:00:00Z');
+    if (tf === '1d') {
+      return { year: d.getUTCFullYear(), month: d.getUTCMonth()+1, day: d.getUTCDate() } as any;
+    }
+    return Math.floor(d.getTime()/1000) as UTCTimestamp;
+  };
+
+  // Update overlay box with vertical bounds from selected data range
+  const updateHighlight = (r?: {start?: string; end?: string}) => {
+    const ov = highlightRef.current;
+    const chart = chartRef.current;
+    const series = seriesRef.current;
+    if (!ov || !chart || !series) return;
+    const rs = (r?.start ?? range.start);
+    const re = (r?.end ?? range.end);
+    if (!rs || !re) { ov.style.display = 'none'; return; }
+    try {
+      const ts1 = isoToTime(rs);
+      const ts2 = isoToTime(re);
+      const x1 = chart.timeScale().timeToCoordinate(ts1);
+      const x2 = chart.timeScale().timeToCoordinate(ts2);
+      if (x1 == null || x2 == null) { ov.style.display = 'none'; return; }
+      const left = Math.min(x1, x2);
+      const width = Math.max(2, Math.abs(x2 - x1));
+
+      // compute vertical bounds
+      const sMs = new Date(rs + 'T00:00:00Z').getTime();
+      const eMs = new Date(re + 'T00:00:00Z').getTime();
+      let hi = Number.NEGATIVE_INFINITY, lo = Number.POSITIVE_INFINITY;
+      for (const d of (dataRef.current || [])) {
+        let tms: number | null = null;
+        if (typeof d.time === 'number') tms = d.time * 1000;
+        else if (d.time && typeof d.time === 'object' && 'year' in d.time) tms = Date.UTC(d.time.year, d.time.month-1, d.time.day);
+        if (tms == null) continue;
+        if (tms >= sMs && tms <= eMs) {
+          if (d.high > hi) hi = d.high;
+          if (d.low < lo) lo = d.low;
+        }
+      }
+      if (!Number.isFinite(hi) || !Number.isFinite(lo)) { ov.style.display = 'none'; return; }
+      const pad = Math.max((hi - lo) * 0.04, (hi + lo) * 0.0005);
+      const yTop = series.priceToCoordinate(hi + pad);
+      const yBot = series.priceToCoordinate(lo - pad);
+      if (yTop == null || yBot == null) { ov.style.display = 'none'; return; }
+      const top = Math.min(yTop, yBot);
+      const bottomCoord = Math.max(yTop, yBot);
+      const containerH = containerRef.current?.clientHeight ?? 0;
+      const bottomPx = Math.max(0, containerH - bottomCoord);
+
+      ov.style.display = 'block';
+      ov.style.left = `${Math.round(left)}px`;
+      ov.style.width = `${Math.round(width)}px`;
+      ov.style.top = `${Math.round(top)}px`;
+      ov.style.bottom = `${Math.round(bottomPx)}px`;
+    } catch {
+      ov.style.display = 'none';
+    }
+  };
+
+  // Recompute highlight when range or tf changes
+  useEffect(() => { updateHighlight(); }, [range.start, range.end, tf]);
+
+  // Render mini chart for selected similar item
+  useEffect(() => {
+    if (!simOpen) return;
+    if (!simContainerRef.current) return;
+    if (!simItems || simItems.length === 0) return;
+    const item = simItems[Math.min(simIndex, simItems.length-1)];
+    if (!item) return;
+
+    // init chart once per mount
+    let chart = simChartRef.current;
+    if (!chart) {
+      chart = createChart(simContainerRef.current, {
+        height: 320,
+        layout: { background: { type: ColorType.Solid, color: 'transparent' }, textColor: '#334155' },
+        grid: { vertLines: { color: '#e2e8f0' }, horzLines: { color: '#e2e8f0' } },
+        rightPriceScale: { borderColor: '#cbd5e1' },
+        timeScale: { borderColor: '#cbd5e1' },
+      });
+      simChartRef.current = chart;
+      simSeriesRef.current = chart.addCandlestickSeries({ upColor:'#16a34a', downColor:'#ef4444', wickUpColor:'#16a34a', wickDownColor:'#ef4444', borderUpColor:'#16a34a', borderDownColor:'#ef4444' });
+    }
+
+    // fetch data
+    setError(null);
+    fetchDailySlice(item.symbol, item.start_time, item.end_time)
+      .then(data => {
+        simSeriesRef.current?.setData(data);
+        simChartRef.current?.timeScale().fitContent();
+      })
+      .catch(() => {/* swallow modal errors */});
+
+    // cleanup when modal closes
+    return () => {
+      // keep chart for reuse while modal open; destroyed when modal closes by outer effect
+    };
+  }, [simOpen, simIndex, simItems]);
+
+  // Destroy modal chart when closing
+  useEffect(() => {
+    if (!simOpen && simChartRef.current) {
+      simChartRef.current.remove();
+      simChartRef.current = null;
+      simSeriesRef.current = null;
+    }
+  }, [simOpen]);
 
   const onFindSimilar = async () => {
     if (!range.start || !range.end) {
@@ -269,10 +433,16 @@ export default function HomePage() {
         throw new Error(`POST ${url} failed: HTTP ${res.status}${text ? ` - ${text}` : ''}`);
       }
       const j = await res.json();
-      alert('相似片段 Top 5:\n' + j.items.map((x:any, i:number)=>`${i+1}. ${x.symbol} ${x.start_time.slice(0,10)}~${x.end_time.slice(0,10)}  dist=${x.distance.toFixed(3)}`).join('\n'));
+      setSimError(null);
+      const items = Array.isArray(j.items) ? j.items : [];
+      setSimItems(items);
+      setSimIndex(0);
+      setSimOpen(true);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      alert('呼叫相似搜尋失敗：\n' + msg + '\n\n建議：\n1) 確認 API 已啟動：http://localhost:8000/health\n2) 停用可能攔截請求的瀏覽器外掛（或改用無痕視窗）\n3) 若前端非 3000 埠，請調整 API CORS 設定');
+      setSimItems([]);
+      setSimError('呼叫相似搜尋失敗：\n' + msg + '\n\n建議：\n1) 確認 API 已啟動：http://localhost:8000/health\n2) 停用可能攔截請求的瀏覽器外掛（或改用無痕視窗）\n3) 若前端非 3000 埠，請調整 API CORS 設定');
+      setSimOpen(true);
     }
   };
 
@@ -311,6 +481,42 @@ export default function HomePage() {
       <div className="header" suppressHydrationWarning>
         <h1 className="title">FinLab Starter</h1>
       </div>
+      {simOpen && (
+        <div className="modal-overlay" onMouseDown={(e)=>{ if (e.target === e.currentTarget) setSimOpen(false); }}>
+          <div className="modal" role="dialog" aria-modal="true" aria-label="相似片段結果">
+            <div className="modal-header">相似片段 {simError ? '' : `Top ${Math.min(5, simItems.length)}`}</div>
+            <div className="modal-body">
+              {simError ? (
+                <div style={{whiteSpace:'pre-wrap'}}>{simError}</div>
+              ) : (
+                <div className="modal-grid">
+                  <div>
+                    <ul className="modal-list">
+                      {simItems.slice(0,5).map((x:any, i:number)=> (
+                        <li key={i} className={`modal-list-item ${i===simIndex ? 'active':''}`} onMouseDown={(e)=>{e.preventDefault(); setSimIndex(i);}}>
+                          <div>
+                            <strong style={{marginRight:8}}>{i+1}.</strong>
+                            <span style={{fontWeight:600}}>{x.symbol}</span>
+                            <span style={{marginLeft:8, color:'#64748b'}}>{(x.start_time||'').slice(0,10)} ~ {(x.end_time||'').slice(0,10)}</span>
+                          </div>
+                          <div style={{whiteSpace:'nowrap', color:'#334155'}}>d={Number(x.distance).toFixed(3)}</div>
+                        </li>
+                      ))}
+                      {simItems.length === 0 && <li className="modal-list-item">— 無結果 —</li>}
+                    </ul>
+                  </div>
+                  <div>
+                    <div ref={simContainerRef} className="mini-chart" />
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="modal-footer">
+              <button className="btn" onClick={()=>setSimOpen(false)}>關閉</button>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="toolbar" suppressHydrationWarning>
         <span className="label">Symbol：</span>
         <div className="dropdown" ref={symbolMenuRef}>
@@ -368,7 +574,7 @@ export default function HomePage() {
             if (!symbol.trim()) { alert('請先選擇或新增代碼'); return; }
             setLoading(true);
             fetchOhlcv(symbol, tf)
-              .then(d=>{ seriesRef.current?.setData(d); chartRef.current?.timeScale().fitContent(); })
+              .then(d=>{ seriesRef.current?.setData(d); dataRef.current = d as any; chartRef.current?.timeScale().fitContent(); updateHighlight(); })
               .catch((e: unknown)=>{ const msg = e instanceof Error ? e.message : String(e); setError(msg); })
               .finally(()=> setLoading(false));
           }}

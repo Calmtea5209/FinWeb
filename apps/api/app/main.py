@@ -396,6 +396,11 @@ def similar(req: SimilarSearchRequest, db: Session | None = Depends(get_db_safe)
     # Deduplicate and cap size to avoid rate limiting
     seen = set()
     codes = [c for c in codes if not (c in seen or seen.add(c))][:50]
+    # Restrict candidate search to recent N years (default 5)
+    lookback_years = getattr(req, 'lookback_years', 5) or 5
+    # Use now(tz='UTC') to avoid tz_localize edge cases
+    cutoff_utc = pd.Timestamp.now(tz='UTC') - pd.DateOffset(years=int(lookback_years))
+
     for code in codes:
         if db_symbols:
             s = next((x for x in db_symbols if x.code == code), None)
@@ -409,6 +414,10 @@ def similar(req: SimilarSearchRequest, db: Session | None = Depends(get_db_safe)
                         sdf.index = sdf.index.tz_localize('UTC')
                     except Exception:
                         pass
+                try:
+                    sdf = sdf[sdf.index >= cutoff_utc]
+                except Exception:
+                    pass
             else:
                 sdf = pd.DataFrame()
         else:
@@ -417,6 +426,11 @@ def similar(req: SimilarSearchRequest, db: Session | None = Depends(get_db_safe)
                 sdf = yahoo_df(code, interval="1d", y_range="10y")
             except httpx.HTTPError:
                 continue
+        if not sdf.empty:
+            try:
+                sdf = sdf[sdf.index >= cutoff_utc]
+            except Exception:
+                pass
         if len(sdf) < req.m + 10:
             continue
         s_ret = to_returns(sdf["close"])

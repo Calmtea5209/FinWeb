@@ -13,6 +13,8 @@ class SimilarSearchRequest(BaseModel):
     m: int = 30
     top: int = 10
     universe: Optional[List[str]] = None
+    # Only consider candidate matches within the last N years (relative to now)
+    lookback_years: Optional[int] = 5
 
 class BacktestConfig(BaseModel):
     symbol: str

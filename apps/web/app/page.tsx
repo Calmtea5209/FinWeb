@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { createChart, ISeriesApi, UTCTimestamp, ColorType } from 'lightweight-charts';
+import { createChart, ISeriesApi, UTCTimestamp, ColorType, TickMarkType } from 'lightweight-charts';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -108,6 +108,7 @@ export default function HomePage() {
       grid: { vertLines: { color: '#e2e8f0' }, horzLines: { color: '#e2e8f0' } },
       rightPriceScale: { borderColor: '#cbd5e1' },
       timeScale: { borderColor: '#cbd5e1' },
+      localization: { locale: 'zh-TW' as any },
     });
     const series = chart.addCandlestickSeries({
       upColor: '#16a34a', downColor: '#ef4444',
@@ -314,6 +315,66 @@ export default function HomePage() {
     const id = setInterval(tick, refreshMs);
     return () => { cancelled = true; clearInterval(id); };
   }, [symbol, tf, refreshMs]);
+
+  // Crosshair/time label: format with Asia/Taipei
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const isDaily = tf === '1d';
+    const fmtDate = new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit' });
+    const fmtDateTime = new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit', hour12: false, hour: '2-digit', minute: '2-digit' });
+    const timeFormatter = (time: any) => {
+      let ms: number | null = null;
+      if (typeof time === 'number') ms = time * 1000;
+      else if (time && typeof time === 'object' && 'year' in time) ms = Date.UTC(time.year as number, (time.month as number) - 1, time.day as number);
+      if (ms == null) return '';
+      const d = new Date(ms);
+      const s = isDaily ? fmtDate.format(d) : fmtDateTime.format(d);
+      // unify separators to YYYY-MM-DD (or YYYY-MM-DD HH:mm)
+      return s.replaceAll('/', '-');
+    };
+    chart.applyOptions({ localization: { locale: 'zh-TW' as any, timeFormatter: timeFormatter as any } });
+  }, [tf]);
+
+  // Ensure x-axis shows appropriate units when zooming (Asia/Taipei)
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const isDaily = tf === '1d';
+    const fmtTick = (time: any, markType?: TickMarkType) => {
+      // time can be UTCTimestamp (number) or BusinessDay-like object
+      let ms: number;
+      if (typeof time === 'number') {
+        ms = time * 1000;
+      } else if (time && typeof time === 'object' && 'year' in time) {
+        ms = Date.UTC(time.year as number, (time.month as number) - 1, time.day as number);
+      } else {
+        return '';
+      }
+      const d = new Date(ms);
+      // Keep intraday labels fixed to M/D HH:mm regardless of zoom
+      if (!isDaily) {
+        const md = new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' }).format(d).replace(/\s/g, '');
+        const hm = new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, hour: '2-digit', minute: '2-digit' }).format(d);
+        return `${md} ${hm}`;
+      }
+      if (markType === TickMarkType.Year) {
+        return new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', year: 'numeric' }).format(d);
+      }
+      if (markType === TickMarkType.Month) {
+        // Avoid Year/Month style to prevent confusion with Month/Day
+        return new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric' }).format(d);
+      }
+      return new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' }).format(d).replace(/\s/g, '');
+    };
+    chart.applyOptions({
+      timeScale: {
+        timeVisible: !isDaily,
+        secondsVisible: false, // fixed minutes display for intraday
+        tickMarkFormatter: fmtTick as any,
+      },
+    });
+  }, [tf]);
 
   // Helper: convert ISO to Time based on tf
   const isoToTime = (iso: string): any => {

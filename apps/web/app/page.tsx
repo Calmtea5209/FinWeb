@@ -463,7 +463,14 @@ export default function HomePage() {
       const x1 = chart.timeScale().timeToCoordinate(ts1);
       const x2 = chart.timeScale().timeToCoordinate(ts2);
       if (x1 == null || x2 == null) { ov.style.display = 'none'; return; }
-      const left = Math.min(x1, x2);
+      // Adjust for left price scale width when visible (e.g., volume shown)
+      let leftOffset = 0;
+      try {
+        const lps: any = (chart as any).priceScale ? (chart as any).priceScale('left') : null;
+        const w = lps && typeof lps.width === 'function' ? lps.width() : 0;
+        if (Number.isFinite(w)) leftOffset = w;
+      } catch {}
+      const left = Math.min(x1, x2) + leftOffset;
       const width = Math.max(2, Math.abs(x2 - x1));
 
       // compute vertical bounds
@@ -563,10 +570,12 @@ export default function HomePage() {
     }
     // Choose source: prefer trades_detail to ensure state-valid entries
     const srcEvents: Array<any> = Array.isArray(rep.trades_detail) && rep.trades_detail.length > 0
-      ? rep.trades_detail.flatMap((t:any) => ([
-          { ts: t.entry_ts, type: 'buy', price: t.entry_price },
-          t.exit_ts ? { ts: t.exit_ts, type: 'sell', price: t.exit_price } : null,
-        ].filter(Boolean)))
+      ? rep.trades_detail.flatMap((t:any) => {
+          const out: any[] = [];
+          if (t.entry_ts) out.push({ ts: t.entry_ts, type: t.carried ? 'carried' : 'buy', price: t.entry_price });
+          if (t.exit_ts) out.push({ ts: t.exit_ts, type: 'sell', price: t.exit_price });
+          return out;
+        })
       : (rep.events || []);
 
     // helper to get ms from chart bar time
@@ -577,7 +586,8 @@ export default function HomePage() {
     };
     const bars = (dataRef.current || []) as Array<any>;
     const markers = srcEvents.map((ev: any) => {
-      const isBuy = (ev.type || ev.side) === 'buy';
+      const kind = (ev.type || ev.side);
+      const isBuy = kind === 'buy' || kind === 'carried';
       const iso = String(ev.ts || '').slice(0,10);
       let timeForMarker: any = null;
       if (tf === '1d') {
@@ -598,7 +608,7 @@ export default function HomePage() {
         position: isBuy ? 'belowBar' as const : 'aboveBar' as const,
         color: isBuy ? '#16a34a' : '#ef4444',
         shape: isBuy ? 'arrowUp' as const : 'arrowDown' as const,
-        text: (isBuy ? '買入 ' : '賣出 ') + (typeof ev.price === 'number' ? String((ev.price as number).toFixed(2)) : ''),
+        text: (kind === 'carried' ? '承接 ' : (isBuy ? '買入 ' : '賣出 ')) + (typeof ev.price === 'number' ? String((ev.price as number).toFixed(2)) : ''),
       };
     });
     try { series.setMarkers(markers as any); } catch {}

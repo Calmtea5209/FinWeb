@@ -14,7 +14,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 redis = Redis.from_url(REDIS_URL)
 q = Queue("default", connection=redis)
 
-def _yahoo_close_df(symbol: str, interval: str = "1d", y_range: str = "10y") -> pd.DataFrame:
+def _yahoo_close_df(symbol: str, interval: str = "1d", y_range: str = "5y") -> pd.DataFrame:
     """Fetch Yahoo Finance OHLC and return a tz-aware (UTC) close series DataFrame.
     Returns DataFrame indexed by UTC timestamps with a 'close' column.
     """
@@ -64,7 +64,7 @@ def run_backtest_job(cfg_json: dict):
         cash = float(cfg.get("cash", 1_000_000))
 
         # Prefer Yahoo daily data to match frontend chart; fallback to DB if Yahoo unavailable
-        full = _yahoo_close_df(symbol, interval="1d", y_range="10y")
+        full = _yahoo_close_df(symbol, interval="1d", y_range="5y")
         if not full.empty:
             start_utc = pd.to_datetime(start, utc=True)
             end_utc = pd.to_datetime(end, utc=True)
@@ -88,8 +88,10 @@ def run_backtest_job(cfg_json: dict):
                     q_df.set_index("ts", inplace=True)
         if q_df.empty:
             raise ValueError("No data in range")
-        fast_ma = sma(q_df["close"], fast)
-        slow_ma = sma(q_df["close"], slow)
+        # Compute MAs on the broader series (full chart), then restrict performance to selection
+        base_df = full if not full.empty else q_df
+        fast_ma = sma(base_df["close"], fast)
+        slow_ma = sma(base_df["close"], slow)
         # detect true cross points（上一根不在同側才算交叉）
         cross_up = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
         cross_dn = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
@@ -101,30 +103,41 @@ def run_backtest_job(cfg_json: dict):
             pos_series.iloc[0] = 0
         pos = pos_series.ffill().fillna(0).astype(int)
 
-        ret = np.log(q_df["close"]).diff().fillna(0.0)
-        strat_ret = ret * pos.shift(1).fillna(0.0)
-        equity = (1 + strat_ret).cumprod() * cash
+        # Log returns on base series; then only keep selected window for performance
+        ret_log = np.log(base_df["close"]).diff().fillna(0.0)
+        strat_log = ret_log * pos.shift(1).fillna(0.0)
+        start_utc = pd.to_datetime(start, utc=True)
+        end_utc = pd.to_datetime(end, utc=True)
+        mask = (base_df.index >= start_utc) & (base_df.index <= end_utc)
+        sel_strat = strat_log[mask]
+        equity = (np.exp(sel_strat.cumsum()) * cash) if len(sel_strat) > 0 else pd.Series([cash])
 
-        # Events based on position transitions; execute at signal-bar close
-        closes = q_df["close"].astype(float)
-        idx = list(q_df.index)
+        # Events based strictly on rule triggers inside the window (no carried state)
+        closes = base_df["close"].astype(float)
+        idx = list(base_df.index[mask])
         events = []
         trades_detail = []
-        for i in range(1, len(idx)):
-            prev = int(pos.iloc[i-1])
-            cur = int(pos.iloc[i])
-            if prev == 0 and cur == 1:
-                t = idx[i]
-                events.append({"ts": t.isoformat(), "type": "buy", "price": float(closes.iloc[i])})
-            elif prev == 1 and cur == 0:
-                t = idx[i]
-                events.append({"ts": t.isoformat(), "type": "sell", "price": float(closes.iloc[i])})
+        # restrict cross signals to the window
+        cu_win = cross_up.loc[idx] if len(idx) else pd.Series(dtype=bool)
+        cd_win = cross_dn.loc[idx] if len(idx) else pd.Series(dtype=bool)
+        in_pos = False
+        for t in idx:
+            is_up = bool(cu_win.loc[t]) if t in cu_win.index else False
+            is_dn = bool(cd_win.loc[t]) if t in cd_win.index else False
+            if is_up and not in_pos:
+                price = float(closes.loc[t]) if t in closes.index else float('nan')
+                events.append({"ts": t.isoformat(), "type": "buy", "price": price})
+                in_pos = True
+            elif is_dn and in_pos:
+                price = float(closes.loc[t]) if t in closes.index else float('nan')
+                events.append({"ts": t.isoformat(), "type": "sell", "price": price})
+                in_pos = False
 
-        # Pair into trades
+        # Pair into trades; only buys that occur inside the window can open a position
         open_trade = None
         for ev in events:
             if ev["type"] == "buy" and open_trade is None:
-                open_trade = {"entry_ts": ev["ts"], "entry_price": ev["price"]}
+                open_trade = {"entry_ts": ev["ts"], "entry_price": ev["price"], "carried": False}
             elif ev["type"] == "sell" and open_trade is not None:
                 exit_ts = ev["ts"]
                 exit_price = ev["price"]
@@ -136,16 +149,45 @@ def run_backtest_job(cfg_json: dict):
                     "exit_ts": exit_ts,
                     "exit_price": exit_price,
                     "return": ret_pct,
+                    "carried": bool(open_trade.get("carried", False)),
                 })
                 open_trade = None
+        # If still holding at end of window, record an open trade without exit so markers can render
+        if open_trade is not None:
+            trades_detail.append({
+                "entry_ts": open_trade["entry_ts"],
+                "entry_price": float(open_trade["entry_price"]),
+                "exit_ts": None,
+                "exit_price": None,
+                "return": None,
+                "carried": bool(open_trade.get("carried", False)),
+            })
+
+        # Compute final equity exactly from executed trades within selection
+        factor = 1.0
+        # closed trades
+        for tr in trades_detail:
+            try:
+                factor *= float(tr["exit_price"]) / float(tr["entry_price"]) if tr["exit_price"] and tr["entry_price"] else 1.0
+            except Exception:
+                pass
+        # open trade at the end of window
+        last_close = float(closes.loc[idx[-1]]) if len(idx) else None
+        if len(idx) and (len(events) > 0 and events[-1]["type"] == "buy") and last_close is not None:
+            try:
+                factor *= last_close / float(events[-1]["price"])
+            except Exception:
+                pass
+        # No buy inside window -> no position counted in performance
+        final_equity = float(cash * factor)
 
         report = {
             "symbol": symbol,
             "start": start,
             "end": end,
             "params": {"fast": fast, "slow": slow},
-            "final_equity": float(equity.iloc[-1]),
-            "total_return": float(equity.iloc[-1]/cash - 1.0),
+            "final_equity": final_equity,
+            "total_return": float(final_equity/cash - 1.0),
             "max_drawdown": float((equity / equity.cummax() - 1.0).min()),
             "trades": int(len(trades_detail)),
             "events": events,

@@ -11,8 +11,14 @@ export default function HomePage() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<ReturnType<typeof createChart> | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const ma20Ref = useRef<ISeriesApi<'Line'> | null>(null);
+  const ma50Ref = useRef<ISeriesApi<'Line'> | null>(null);
+  const volRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const highlightRef = useRef<HTMLDivElement | null>(null);
   const dataRef = useRef<Array<{time:any; open:number; high:number; low:number; close:number}>>([]);
+  const ma20DataRef = useRef<Array<{ time:any; value:number }>>([]);
+  const ma50DataRef = useRef<Array<{ time:any; value:number }>>([]);
+  const volDataRef = useRef<Array<{ time:any; value:number; color?: string }>>([]);
 
   const defaultSymbols = (process.env.NEXT_PUBLIC_SYMBOLS || '2330.TW,AAPL')
     .split(',').map(s=>s.trim()).filter(Boolean);
@@ -42,6 +48,17 @@ export default function HomePage() {
   const simSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const simContainerRef = useRef<HTMLDivElement | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [showMA20, setShowMA20] = useState(false);
+  const [showMA50, setShowMA50] = useState(false);
+  const [showVOL, setShowVOL] = useState(false);
+  // Backtest modal state
+  const [btOpen, setBtOpen] = useState(false);
+  const [btFast, setBtFast] = useState(10);
+  const [btSlow, setBtSlow] = useState(30);
+  const [btCash, setBtCash] = useState(1000000);
+  const [btJob, setBtJob] = useState<string | null>(null);
+  const [btStatus, setBtStatus] = useState<string | null>(null);
+  const [btReport, setBtReport] = useState<any | null>(null);
 
   const fetchOhlcv = async (sym: string, timeframe: string) => {
     // Choose sensible default ranges per timeframe to avoid short windows
@@ -57,25 +74,34 @@ export default function HomePage() {
     }
     const j = await r.json();
     setRangeLabel(j.range || rng);
-    const data = (j.items as Ohlcv[]).map(d => {
-      const date = new Date(d.ts);
+    const mapTime = (ts: string) => {
+      const date = new Date(ts);
       if (timeframe === '1d') {
-        // Use BusinessDay-like time to avoid DST/timezone visual artifacts on daily bars
-        return {
-          time: {
-            year: date.getUTCFullYear(),
-            month: (date.getUTCMonth() + 1) as number,
-            day: date.getUTCDate() as number,
-          } as any,
-          open: d.open, high: d.high, low: d.low, close: d.close,
-        };
+        return { year: date.getUTCFullYear(), month: (date.getUTCMonth() + 1) as number, day: date.getUTCDate() as number } as any;
       }
-      return {
-        time: (date.getTime() / 1000) as UTCTimestamp,
-        open: d.open, high: d.high, low: d.low, close: d.close,
-      };
-    });
-    return data;
+      return (date.getTime() / 1000) as UTCTimestamp;
+    };
+    const items = (j.items as Ohlcv[]);
+    const price = items.map(d => ({ time: mapTime(d.ts), open: d.open, high: d.high, low: d.low, close: d.close }));
+    // volume histogram, color by candle direction
+    const upColor = 'rgba(22,163,74,0.45)';
+    const downColor = 'rgba(239,68,68,0.45)';
+    const vol = items.map(d => ({ time: mapTime(d.ts), value: d.volume ?? 0, color: (d.close >= d.open) ? upColor : downColor }));
+    // SMA helpers
+    const sma = (arr: number[], period: number) => {
+      const out: Array<{ time:any; value:number }> = [];
+      let sum = 0;
+      for (let i = 0; i < arr.length; i++) {
+        sum += arr[i];
+        if (i >= period) sum -= arr[i - period];
+        if (i >= period - 1) out.push({ time: price[i].time, value: sum / period });
+      }
+      return out;
+    };
+    const closes = items.map(d => d.close);
+    const ma20 = sma(closes, 20);
+    const ma50 = sma(closes, 50);
+    return { price, vol, ma20, ma50 } as const;
   };
 
   // Fetch a daily slice for modal preview
@@ -107,9 +133,12 @@ export default function HomePage() {
       layout: { background: { type: ColorType.Solid, color: 'transparent' }, textColor: '#334155' },
       grid: { vertLines: { color: '#e2e8f0' }, horzLines: { color: '#e2e8f0' } },
       rightPriceScale: { borderColor: '#cbd5e1' },
+      leftPriceScale: { visible: false, borderColor: '#cbd5e1' },
       timeScale: { borderColor: '#cbd5e1' },
       localization: { locale: 'zh-TW' as any },
     });
+    // volume histogram first (behind), attach to left scale for visible axis
+    volRef.current = chart.addHistogramSeries({ priceScaleId: 'left', priceFormat: { type: 'volume' }, visible: false });
     const series = chart.addCandlestickSeries({
       upColor: '#16a34a', downColor: '#ef4444',
       wickUpColor: '#16a34a', wickDownColor: '#ef4444',
@@ -117,6 +146,9 @@ export default function HomePage() {
     });
     chartRef.current = chart;
     seriesRef.current = series;
+    // MA lines (hidden init)
+    ma20Ref.current = chart.addLineSeries({ color: '#f59e0b', lineWidth: 2, priceScaleId: 'right', visible: false });
+    ma50Ref.current = chart.addLineSeries({ color: '#0ea5e9', lineWidth: 2, priceScaleId: 'right', visible: false });
 
     const resize = () => { chart.applyOptions({ width: containerRef.current!.clientWidth }); updateHighlight(); };
     window.addEventListener('resize', resize);
@@ -124,9 +156,15 @@ export default function HomePage() {
     setError(null);
     if (symbol.trim()) {
     fetchOhlcv(symbol, tf)
-      .then(data => {
-        series.setData(data);
-        dataRef.current = data as any;
+      .then(pack => {
+        series.setData(pack.price);
+        dataRef.current = pack.price as any;
+        ma20DataRef.current = pack.ma20 as any;
+        ma50DataRef.current = pack.ma50 as any;
+        volDataRef.current = pack.vol as any;
+        if (volRef.current) volRef.current.setData(pack.vol);
+        if (ma20Ref.current) ma20Ref.current.setData(pack.ma20);
+        if (ma50Ref.current) ma50Ref.current.setData(pack.ma50);
         chart.timeScale().fitContent();
         updateHighlight();
       })
@@ -297,6 +335,18 @@ export default function HomePage() {
     }
   }, [tf]);
 
+  // Toggle indicator visibility. For volume, show left axis and pin to bottom via left scale margins
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    if (ma20Ref.current) ma20Ref.current.applyOptions({ visible: showMA20 });
+    if (ma50Ref.current) ma50Ref.current.applyOptions({ visible: showMA50 });
+    if (volRef.current) volRef.current.applyOptions({ visible: showVOL });
+    chart.applyOptions({ leftPriceScale: { visible: showVOL, borderColor: '#cbd5e1' } });
+    const left = chart.priceScale('left');
+    left?.applyOptions({ scaleMargins: showVOL ? { top: 0.75, bottom: 0 } : { top: 0.1, bottom: 0.1 } });
+  }, [showMA20, showMA50, showVOL]);
+
   useEffect(() => {
     if (!seriesRef.current || !chartRef.current) return;
     let cancelled = false;
@@ -304,7 +354,17 @@ export default function HomePage() {
       setError(null);
       if (!symbol.trim()) return;
       fetchOhlcv(symbol, tf)
-        .then(d => { if (!cancelled) { seriesRef.current?.setData(d); dataRef.current = d as any; updateHighlight(); /* do not refit on every refresh */ } })
+        .then(pack => { if (!cancelled) {
+          seriesRef.current?.setData(pack.price);
+          dataRef.current = pack.price as any;
+          ma20DataRef.current = pack.ma20 as any;
+          ma50DataRef.current = pack.ma50 as any;
+          volDataRef.current = pack.vol as any;
+          if (volRef.current) volRef.current.setData(pack.vol);
+          if (ma20Ref.current) ma20Ref.current.setData(pack.ma20);
+          if (ma50Ref.current) ma50Ref.current.setData(pack.ma50);
+          updateHighlight(); /* do not refit on every refresh */
+        } })
         .catch((e: unknown)=>{
           if (cancelled) return;
           const msg = e instanceof Error ? e.message : String(e);
@@ -486,6 +546,33 @@ export default function HomePage() {
     }
   }, [simOpen]);
 
+  // Poll backtest status when a job is created
+  useEffect(() => {
+    if (!btJob) return;
+    let cancelled = false;
+    setBtStatus('queued');
+    const poll = async () => {
+      try {
+        const r = await fetch(`/api/backtest/status?job_id=${encodeURIComponent(btJob)}`, { cache: 'no-store' });
+        if (!r.ok) return;
+        const j = await r.json();
+        if (cancelled) return;
+        setBtStatus(j.status);
+        if (j.status === 'finished' || j.status === 'failed') {
+          try {
+            const r2 = await fetch(`/api/backtest/report?job_id=${encodeURIComponent(btJob)}`, { cache: 'no-store' });
+            const j2 = await r2.json();
+            if (!cancelled) setBtReport(j2.report || { error: 'no report' });
+          } catch {}
+          clearInterval(id);
+        }
+      } catch {}
+    };
+    poll();
+    const id = setInterval(poll, 1000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [btJob]);
+
   const onFindSimilar = async () => {
     if (!range.start || !range.end) {
       alert('請先在圖上點兩下選取起訖（第一次點＝起點；第二次點＝終點）');
@@ -561,7 +648,7 @@ export default function HomePage() {
   return (
     <main className="app" suppressHydrationWarning>
       <div className="header" suppressHydrationWarning>
-        <h1 className="title">FinLab Starter</h1>
+        <h1 className="title">FinLab</h1>
         <div style={{marginLeft:'auto', display:'flex', gap:8, alignItems:'center'}}>
           {userEmail ? (
             <>
@@ -613,7 +700,7 @@ export default function HomePage() {
         </div>
       )}
       <div className="toolbar" suppressHydrationWarning>
-        <span className="label">Symbol：</span>
+        <span className="label">代碼：</span>
         <div className="dropdown" ref={symbolMenuRef}>
           <button className="selectbox" onClick={()=>setSymbolOpen(v=>!v)}>{symbol || '選擇代碼'}</button>
           {symbolOpen && (
@@ -662,6 +749,16 @@ export default function HomePage() {
             </div>
           )}
         </div>
+        <span className="label">指標：</span>
+        <label className="check" suppressHydrationWarning>
+          <input type="checkbox" checked={showMA20} onChange={e=>setShowMA20(e.target.checked)} /> MA20
+        </label>
+        <label className="check" suppressHydrationWarning>
+          <input type="checkbox" checked={showMA50} onChange={e=>setShowMA50(e.target.checked)} /> MA50
+        </label>
+        <label className="check" suppressHydrationWarning>
+          <input type="checkbox" checked={showVOL} onChange={e=>setShowVOL(e.target.checked)} /> 成交量
+        </label>
         <button className="btn btn-primary"
           disabled={loading}
           onClick={()=>{
@@ -669,7 +766,7 @@ export default function HomePage() {
             if (!symbol.trim()) { alert('請先選擇或新增代碼'); return; }
             setLoading(true);
             fetchOhlcv(symbol, tf)
-              .then(d=>{ seriesRef.current?.setData(d); dataRef.current = d as any; chartRef.current?.timeScale().fitContent(); updateHighlight(); })
+              .then(pack=>{ seriesRef.current?.setData(pack.price); dataRef.current = pack.price as any; ma20DataRef.current = pack.ma20 as any; ma50DataRef.current = pack.ma50 as any; volDataRef.current = pack.vol as any; if (volRef.current) volRef.current.setData(pack.vol); if (ma20Ref.current) ma20Ref.current.setData(pack.ma20); if (ma50Ref.current) ma50Ref.current.setData(pack.ma50); chartRef.current?.timeScale().fitContent(); updateHighlight(); })
               .catch((e: unknown)=>{ const msg = e instanceof Error ? e.message : String(e); setError(msg); })
               .finally(()=> setLoading(false));
           }}
@@ -678,6 +775,13 @@ export default function HomePage() {
         </button>
         <button className="btn" onClick={onFindSimilar}>找相似</button>
         <button className="btn" onClick={onDetectPattern}>辨識型態</button>
+        <button className="btn" onClick={()=>{
+          if (!range.start || !range.end) { alert('請先在圖上點兩下選取回測期間'); return; }
+          setBtOpen(true);
+          setBtReport(null);
+          setBtStatus(null);
+          setBtJob(null);
+        }}>回測</button>
         <span className="tip">小技巧：在圖上點兩下依序選取「起點」與「終點」，再按「找相似」</span>
       </div>
       {/* custom dropdown handles deletion; chips removed */}
@@ -743,6 +847,63 @@ export default function HomePage() {
           </div>
         </div>
       </div>
+      {btOpen && (
+        <div className="modal-overlay" onMouseDown={(e)=>{ if (e.target === e.currentTarget) setBtOpen(false); }}>
+          <div className="modal" role="dialog" aria-modal="true" aria-label="回測設定">
+            <div className="modal-header">回測設定（{symbol}：{range.start} ~ {range.end}）</div>
+            <div className="modal-body">
+              <div style={{display:'grid', gridTemplateColumns:'repeat(3, minmax(0,1fr))', gap:12}}>
+                <label className="form-label">初始資金
+                  <input className="input" type="number" min={1000} step={1000} value={btCash} onChange={e=>setBtCash(Number(e.target.value)||0)} />
+                </label>
+                <label className="form-label">快線(天)
+                  <input className="input" type="number" min={2} step={1} value={btFast} onChange={e=>setBtFast(Number(e.target.value)||0)} />
+                </label>
+                <label className="form-label">慢線(天)
+                  <input className="input" type="number" min={3} step={1} value={btSlow} onChange={e=>setBtSlow(Number(e.target.value)||0)} />
+                </label>
+              </div>
+              {btJob && (
+                <div className="info">任務 {btJob} 狀態：{btStatus || '查詢中…'}</div>
+              )}
+              {btReport && !btReport.error && (
+                <div className="sent-card" style={{marginTop:12}}>
+                  <div className="sent-title">回測結果</div>
+                  <div className="sent-metrics">
+                    <div className="sent-kv"><span>最終資金</span><span>{(btReport.final_equity||0).toLocaleString('zh-TW', {maximumFractionDigits:0})}</span></div>
+                    <div className="sent-kv"><span>總報酬</span><span>{btReport.total_return!=null ? Math.round(btReport.total_return*100) : '—'}%</span></div>
+                    <div className="sent-kv"><span>最大回撤</span><span>{btReport.max_drawdown!=null ? Math.round(btReport.max_drawdown*100) : '—'}%</span></div>
+                    <div className="sent-kv"><span>交易次數</span><span>{btReport.trades ?? '—'}</span></div>
+                  </div>
+                </div>
+              )}
+              {btReport && btReport.error && (
+                <div className="alert">回測失敗：{btReport.error}</div>
+              )}
+            </div>
+            <div className="modal-footer">
+              <button className="btn" onClick={()=>setBtOpen(false)}>關閉</button>
+              <button className="btn btn-primary" onClick={async()=>{
+                if (!symbol.trim() || !range.start || !range.end) { alert('請先選擇代碼與回測期間'); return; }
+                if (btFast <= 0 || btSlow <= 0 || btFast >= btSlow) { alert('請確認快線/慢線（快線需小於慢線）'); return; }
+                try {
+                  setBtReport(null); setBtStatus('queued'); setBtJob(null);
+                  const res = await fetch('/api/backtest/submit', {
+                    method: 'POST', headers: { 'Content-Type':'application/json' },
+                    body: JSON.stringify({ config: { symbol, start: range.start, end: range.end, cash: btCash, strategy: 'sma_cross', params: { fast: btFast, slow: btSlow } } })
+                  });
+                  if (!res.ok) { const t = await res.text(); throw new Error(t || 'submit failed'); }
+                  const j = await res.json();
+                  const jid = j.job_id as string;
+                  setBtJob(jid);
+                } catch (e:any) {
+                  setBtReport({ error: e?.message || String(e) });
+                }
+              }}>開始回測</button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

@@ -1,7 +1,8 @@
-import os, json
+import os, json, math
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
+import httpx
 from rq import Queue, get_current_job
 from redis import Redis
 from sqlalchemy.orm import Session
@@ -13,8 +14,45 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 redis = Redis.from_url(REDIS_URL)
 q = Queue("default", connection=redis)
 
+def _yahoo_close_df(symbol: str, interval: str = "1d", y_range: str = "10y") -> pd.DataFrame:
+    """Fetch Yahoo Finance OHLC and return a tz-aware (UTC) close series DataFrame.
+    Returns DataFrame indexed by UTC timestamps with a 'close' column.
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; FinLabBot/1.0)", "Accept": "application/json"}
+    params = {"interval": interval, "range": y_range, "includePrePost": "false", "events": "div,splits"}
+    with httpx.Client(timeout=httpx.Timeout(10.0, read=20.0)) as client:
+        r = client.get(url, params=params, headers=headers)
+        r.raise_for_status()
+        j = r.json()
+    result = ((j or {}).get("chart") or {}).get("result") or []
+    if not result:
+        return pd.DataFrame(columns=["ts","close"]).set_index("ts")
+    res = result[0]
+    ts = res.get("timestamp") or []
+    ind = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+    close_a = ind.get("close") or []
+    rows = []
+    for i in range(min(len(ts), len(close_a))):
+        c = close_a[i]
+        if c is None:
+            continue
+        try:
+            cf = float(c)
+        except Exception:
+            continue
+        if not math.isfinite(cf):
+            continue
+        rows.append({"ts": datetime.fromtimestamp(ts[i], tz=timezone.utc), "close": cf})
+    if not rows:
+        return pd.DataFrame(columns=["ts","close"]).set_index("ts")
+    return pd.DataFrame(rows).sort_values("ts").set_index("ts")
+
 def run_backtest_job(cfg_json: dict):
-    """最小 SMA Cross 回測：快線 > 慢線 進場；反之出場。"""
+    """最小 SMA Cross 回測：快線 > 慢線 進場；反之出場。
+
+    若 DB 資料不足，回落至 Yahoo Finance 日資料；允許 DB 無該代碼。
+    """
     session: Session = SessionLocal()
     try:
         cfg = cfg_json
@@ -25,20 +63,33 @@ def run_backtest_job(cfg_json: dict):
         slow = int(cfg["params"].get("slow", 30))
         cash = float(cfg.get("cash", 1_000_000))
 
-        sym = session.query(Symbol).filter_by(code=symbol).first()
-        if not sym:
-            raise ValueError(f"Unknown symbol {symbol}")
-        q_df = pd.read_sql(
-            f"""SELECT ts, close FROM ohlcv WHERE symbol_id={sym.id}
-                 AND ts >= %(s)s AND ts <= %(e)s ORDER BY ts""" ,
-            session.bind,
-            params={"s": start, "e": end},
-            parse_dates=["ts"]
-        )
-        if q_df.empty:
-            raise ValueError("No data in range")
+        # Try DB first if symbol exists
+        q_df = pd.DataFrame()
+        try:
+            sym = session.query(Symbol).filter_by(code=symbol).first()
+        except Exception:
+            sym = None
+        if sym is not None:
+            q_df = pd.read_sql(
+                f"""SELECT ts, close FROM ohlcv WHERE symbol_id={sym.id}
+                     AND ts >= %(s)s AND ts <= %(e)s ORDER BY ts""" ,
+                session.bind,
+                params={"s": start, "e": end},
+                parse_dates=["ts"]
+            )
+            if not q_df.empty:
+                q_df.set_index("ts", inplace=True)
 
-        q_df.set_index("ts", inplace=True)
+        # Fallback to Yahoo if DB had no rows
+        if q_df.empty:
+            full = _yahoo_close_df(symbol, interval="1d", y_range="10y")
+            if full.empty:
+                raise ValueError("No data in range")
+            start_utc = pd.to_datetime(start, utc=True)
+            end_utc = pd.to_datetime(end, utc=True)
+            q_df = full[(full.index >= start_utc) & (full.index <= end_utc)]
+            if q_df.empty:
+                raise ValueError("No data in range")
         fast_ma = sma(q_df["close"], fast)
         slow_ma = sma(q_df["close"], slow)
         signal = (fast_ma > slow_ma).astype(int)

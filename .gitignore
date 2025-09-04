@@ -37,6 +37,11 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+*.egg
+*.egg-info/
+.eggs/
+__pypackages__/
+.python-version
 
 # Virtual environments
 venv/
@@ -49,10 +54,21 @@ build/
 dist/
 coverage/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+pip-wheel-metadata/
+wheelhouse/
+
+# SQLite (local dev)
+*.sqlite
+*.sqlite3
 
 # Editors / OS
 .vscode/
 .idea/
+.history/
+.envrc
+.iml
 .DS_Store
 Thumbs.db

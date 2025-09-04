@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -8,11 +8,12 @@ import numpy as np
 from datetime import datetime
 
 from .db import Base, engine, get_db, get_db_safe
-from .models import User, Symbol, OHLCV, BacktestRun
-from .schemas import IndicatorRequest, SimilarSearchRequest, BacktestSubmitRequest
+from .models import User, UserAuth, Symbol, OHLCV, BacktestRun
+from .schemas import IndicatorRequest, SimilarSearchRequest, BacktestSubmitRequest, AuthRegister, AuthLogin, AuthToken, UserOut
 from .indicators import compute_indicators
 from .utils import to_returns, z_norm, sliding_zdist
 from .tasks import enqueue_backtest
+from .auth import hash_password, verify_password, create_access_token, decode_token
 import httpx
 import math
 from datetime import datetime, timezone
@@ -41,6 +42,87 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- Auth endpoints ---
+@app.post("/auth/register", response_model=UserOut)
+def auth_register(req: AuthRegister, db: Session = Depends(get_db)):
+    email = str(req.email).strip().lower()
+    if not email:
+        raise HTTPException(400, "invalid email")
+    existing = db.query(User).filter(User.email == email).first()
+    if existing:
+        # if user exists but no auth, allow setting password once
+        ua = db.query(UserAuth).filter(UserAuth.user_id == existing.id).first()
+        if ua:
+            raise HTTPException(400, "user already exists")
+        # set password for existing user
+        try:
+            ph = hash_password(req.password)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        ua = UserAuth(user_id=existing.id, password_hash=ph)
+        db.add(ua)
+        db.commit()
+        db.refresh(existing)
+        return UserOut(id=existing.id, email=existing.email, tz=existing.tz)
+    # create new user
+    try:
+        ph = hash_password(req.password)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    # Always use Asia/Taipei for user timezone per product decision
+    u = User(email=email, tz="Asia/Taipei")
+    db.add(u)
+    db.flush()
+    ua = UserAuth(user_id=u.id, password_hash=ph)
+    db.add(ua)
+    db.commit()
+    db.refresh(u)
+    return UserOut(id=u.id, email=u.email, tz=u.tz)
+
+
+@app.post("/auth/login", response_model=AuthToken)
+def auth_login(req: AuthLogin, db: Session = Depends(get_db)):
+    email = str(req.email).strip().lower()
+    u = db.query(User).filter(User.email == email).first()
+    if not u:
+        raise HTTPException(401, "invalid credentials")
+    ua = db.query(UserAuth).filter(UserAuth.user_id == u.id).first()
+    if not ua or not verify_password(req.password, ua.password_hash):
+        raise HTTPException(401, "invalid credentials")
+    token, exp = create_access_token(u.id, u.email)
+    # update last login
+    try:
+        ua.last_login_at = datetime.now(timezone.utc)
+        db.add(ua)
+        db.commit()
+    except Exception:
+        db.rollback()
+    return AuthToken(access_token=token, token_type="bearer", expires_at=exp.isoformat(), user=UserOut(id=u.id, email=u.email, tz=u.tz))
+
+
+def _user_from_auth_header(authorization: str | None, db: Session) -> User:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "missing bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    payload = decode_token(token)
+    if not payload:
+        raise HTTPException(401, "invalid token")
+    uid = payload.get("sub")
+    try:
+        uid = int(uid)
+    except Exception:
+        raise HTTPException(401, "invalid token")
+    u = db.query(User).filter(User.id == uid).first()
+    if not u:
+        raise HTTPException(401, "user not found")
+    return u
+
+
+@app.get("/auth/me", response_model=UserOut)
+def auth_me(Authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
+    u = _user_from_auth_header(Authorization, db)
+    return UserOut(id=u.id, email=u.email, tz=u.tz)
 
 @app.get("/health")
 def health():

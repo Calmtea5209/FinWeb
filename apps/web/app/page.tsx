@@ -41,6 +41,7 @@ export default function HomePage() {
   const simChartRef = useRef<ReturnType<typeof createChart> | null>(null);
   const simSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const simContainerRef = useRef<HTMLDivElement | null>(null);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
 
   const fetchOhlcv = async (sym: string, timeframe: string) => {
     // Choose sensible default ranges per timeframe to avoid short windows
@@ -182,9 +183,29 @@ export default function HomePage() {
     }
 
     // Update on visible time range change (pan/zoom)
-    const unsub = chart.timeScale().subscribeVisibleTimeRangeChange(() => updateHighlight());
+    const visHandler = () => updateHighlight();
+    chart.timeScale().subscribeVisibleTimeRangeChange(visHandler);
 
-    return () => { window.removeEventListener('resize', resize); unsub(); highlightRef.current?.remove(); highlightRef.current = null; chart.remove(); };
+    return () => {
+      window.removeEventListener('resize', resize);
+      try { chart.timeScale().unsubscribeVisibleTimeRangeChange(visHandler); } catch {}
+      highlightRef.current?.remove();
+      highlightRef.current = null;
+      chart.remove();
+    };
+  }, []);
+
+  // Fetch current user
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/auth/me', { cache: 'no-store' })
+      .then(async r => {
+        if (!r.ok) return;
+        const j = await r.json();
+        if (!cancelled) setUserEmail(j?.email || null);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
   }, []);
 
   // Load/save custom symbols list from localStorage
@@ -480,6 +501,19 @@ export default function HomePage() {
     <main className="app" suppressHydrationWarning>
       <div className="header" suppressHydrationWarning>
         <h1 className="title">FinLab Starter</h1>
+        <div style={{marginLeft:'auto', display:'flex', gap:8, alignItems:'center'}}>
+          {userEmail ? (
+            <>
+              <span className="badge" title={userEmail}>{userEmail}</span>
+              <button className="btn" onClick={async()=>{ try { await fetch('/api/auth/logout',{method:'POST'}); setUserEmail(null); } catch {} }}>登出</button>
+            </>
+          ) : (
+            <>
+              <a className="btn" href="/login">登入</a>
+              <a className="btn" href="/register">註冊</a>
+            </>
+          )}
+        </div>
       </div>
       {simOpen && (
         <div className="modal-overlay" onMouseDown={(e)=>{ if (e.target === e.currentTarget) setSimOpen(false); }}>

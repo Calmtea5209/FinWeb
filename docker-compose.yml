@@ -70,7 +70,8 @@ services:
     depends_on:
       - api
     environment:
-      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+      # Use internal service name for server-side fetches from Next routes
+      - NEXT_PUBLIC_API_URL=http://api:${API_PORT:-8000}
       - PORT=${WEB_PORT:-3000}
     ports:
       - "${WEB_PORT:-3000}:3000"

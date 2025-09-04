@@ -10,6 +10,14 @@ class User(Base):
     tz = Column(String, default="Asia/Taipei")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+class UserAuth(Base):
+    __tablename__ = "user_auth"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True)
+    password_hash = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+
 class Symbol(Base):
     __tablename__ = "symbols"
     id = Column(Integer, primary_key=True, index=True)

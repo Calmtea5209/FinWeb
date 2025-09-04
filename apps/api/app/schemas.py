@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List, Dict
 
 class IndicatorRequest(BaseModel):
@@ -27,3 +27,28 @@ class BacktestConfig(BaseModel):
 class BacktestSubmitRequest(BaseModel):
     config: BacktestConfig
     user_id: Optional[int] = None
+
+
+# --- Auth ---
+class UserOut(BaseModel):
+    id: int
+    email: EmailStr
+    tz: Optional[str] = "Asia/Taipei"
+
+
+class AuthRegister(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6)
+    tz: Optional[str] = "Asia/Taipei"
+
+
+class AuthLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class AuthToken(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: Optional[str] = None  # ISO
+    user: UserOut

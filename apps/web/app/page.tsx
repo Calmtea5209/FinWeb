@@ -167,6 +167,8 @@ export default function HomePage() {
         if (ma50Ref.current) ma50Ref.current.setData(pack.ma50);
         chart.timeScale().fitContent();
         updateHighlight();
+        // re-apply backtest markers if any
+        applyBtMarkers(btReport);
       })
         .catch((e: unknown) => {
           const msg = e instanceof Error ? e.message : String(e);
@@ -364,6 +366,7 @@ export default function HomePage() {
           if (ma20Ref.current) ma20Ref.current.setData(pack.ma20);
           if (ma50Ref.current) ma50Ref.current.setData(pack.ma50);
           updateHighlight(); /* do not refit on every refresh */
+          applyBtMarkers(btReport);
         } })
         .catch((e: unknown)=>{
           if (cancelled) return;
@@ -546,6 +549,61 @@ export default function HomePage() {
     }
   }, [simOpen]);
 
+  // Apply backtest markers to the candlestick series
+  const applyBtMarkers = (rep: any | null) => {
+    const series = seriesRef.current;
+    const chart = chartRef.current;
+    if (!series || !chart) return;
+    if (!rep || !Array.isArray(rep.events) || rep.events.length === 0) {
+      // If no raw events, try to derive from trades_detail
+      if (!Array.isArray(rep?.trades_detail) || rep.trades_detail.length === 0) {
+        try { series.setMarkers([] as any); } catch {}
+        return;
+      }
+    }
+    // Choose source: prefer trades_detail to ensure state-valid entries
+    const srcEvents: Array<any> = Array.isArray(rep.trades_detail) && rep.trades_detail.length > 0
+      ? rep.trades_detail.flatMap((t:any) => ([
+          { ts: t.entry_ts, type: 'buy', price: t.entry_price },
+          t.exit_ts ? { ts: t.exit_ts, type: 'sell', price: t.exit_price } : null,
+        ].filter(Boolean)))
+      : (rep.events || []);
+
+    // helper to get ms from chart bar time
+    const barMs = (t: any): number | null => {
+      if (typeof t === 'number') return t * 1000;
+      if (t && typeof t === 'object' && 'year' in t) return Date.UTC(t.year as number, (t.month as number)-1, t.day as number);
+      return null;
+    };
+    const bars = (dataRef.current || []) as Array<any>;
+    const markers = srcEvents.map((ev: any) => {
+      const isBuy = (ev.type || ev.side) === 'buy';
+      const iso = String(ev.ts || '').slice(0,10);
+      let timeForMarker: any = null;
+      if (tf === '1d') {
+        timeForMarker = isoToTime(iso);
+      } else {
+        const startMs = new Date(iso + 'T00:00:00Z').getTime();
+        const endMs = startMs + 24*60*60*1000 - 1;
+        // pick last bar within that UTC day (closest to session close)
+        let chosen: any = null;
+        for (let i = bars.length - 1; i >= 0; i--) {
+          const ms = barMs(bars[i].time);
+          if (ms != null && ms >= startMs && ms <= endMs) { chosen = bars[i].time; break; }
+        }
+        timeForMarker = chosen ?? isoToTime(iso);
+      }
+      return {
+        time: timeForMarker,
+        position: isBuy ? 'belowBar' as const : 'aboveBar' as const,
+        color: isBuy ? '#16a34a' : '#ef4444',
+        shape: isBuy ? 'arrowUp' as const : 'arrowDown' as const,
+        text: (isBuy ? '買入 ' : '賣出 ') + (typeof ev.price === 'number' ? String((ev.price as number).toFixed(2)) : ''),
+      };
+    });
+    try { series.setMarkers(markers as any); } catch {}
+  };
+
   // Poll backtest status when a job is created
   useEffect(() => {
     if (!btJob) return;
@@ -562,7 +620,7 @@ export default function HomePage() {
           try {
             const r2 = await fetch(`/api/backtest/report?job_id=${encodeURIComponent(btJob)}`, { cache: 'no-store' });
             const j2 = await r2.json();
-            if (!cancelled) setBtReport(j2.report || { error: 'no report' });
+            if (!cancelled) { setBtReport(j2.report || { error: 'no report' }); applyBtMarkers(j2.report); }
           } catch {}
           clearInterval(id);
         }
@@ -572,6 +630,9 @@ export default function HomePage() {
     const id = setInterval(poll, 1000);
     return () => { cancelled = true; clearInterval(id); };
   }, [btJob]);
+
+  // Re-apply markers if timeframe changes (daily uses BusinessDay mapping)
+  useEffect(() => { applyBtMarkers(btReport); }, [btReport, tf]);
 
   const onFindSimilar = async () => {
     if (!range.start || !range.end) {
@@ -766,7 +827,7 @@ export default function HomePage() {
             if (!symbol.trim()) { alert('請先選擇或新增代碼'); return; }
             setLoading(true);
             fetchOhlcv(symbol, tf)
-              .then(pack=>{ seriesRef.current?.setData(pack.price); dataRef.current = pack.price as any; ma20DataRef.current = pack.ma20 as any; ma50DataRef.current = pack.ma50 as any; volDataRef.current = pack.vol as any; if (volRef.current) volRef.current.setData(pack.vol); if (ma20Ref.current) ma20Ref.current.setData(pack.ma20); if (ma50Ref.current) ma50Ref.current.setData(pack.ma50); chartRef.current?.timeScale().fitContent(); updateHighlight(); })
+              .then(pack=>{ seriesRef.current?.setData(pack.price); dataRef.current = pack.price as any; ma20DataRef.current = pack.ma20 as any; ma50DataRef.current = pack.ma50 as any; volDataRef.current = pack.vol as any; if (volRef.current) volRef.current.setData(pack.vol); if (ma20Ref.current) ma20Ref.current.setData(pack.ma20); if (ma50Ref.current) ma50Ref.current.setData(pack.ma50); chartRef.current?.timeScale().fitContent(); updateHighlight(); applyBtMarkers(btReport); })
               .catch((e: unknown)=>{ const msg = e instanceof Error ? e.message : String(e); setError(msg); })
               .finally(()=> setLoading(false));
           }}

@@ -63,39 +63,81 @@ def run_backtest_job(cfg_json: dict):
         slow = int(cfg["params"].get("slow", 30))
         cash = float(cfg.get("cash", 1_000_000))
 
-        # Try DB first if symbol exists
-        q_df = pd.DataFrame()
-        try:
-            sym = session.query(Symbol).filter_by(code=symbol).first()
-        except Exception:
-            sym = None
-        if sym is not None:
-            q_df = pd.read_sql(
-                f"""SELECT ts, close FROM ohlcv WHERE symbol_id={sym.id}
-                     AND ts >= %(s)s AND ts <= %(e)s ORDER BY ts""" ,
-                session.bind,
-                params={"s": start, "e": end},
-                parse_dates=["ts"]
-            )
-            if not q_df.empty:
-                q_df.set_index("ts", inplace=True)
-
-        # Fallback to Yahoo if DB had no rows
-        if q_df.empty:
-            full = _yahoo_close_df(symbol, interval="1d", y_range="10y")
-            if full.empty:
-                raise ValueError("No data in range")
+        # Prefer Yahoo daily data to match frontend chart; fallback to DB if Yahoo unavailable
+        full = _yahoo_close_df(symbol, interval="1d", y_range="10y")
+        if not full.empty:
             start_utc = pd.to_datetime(start, utc=True)
             end_utc = pd.to_datetime(end, utc=True)
             q_df = full[(full.index >= start_utc) & (full.index <= end_utc)]
-            if q_df.empty:
-                raise ValueError("No data in range")
+        else:
+            q_df = pd.DataFrame()
+        if q_df.empty:
+            try:
+                sym = session.query(Symbol).filter_by(code=symbol).first()
+            except Exception:
+                sym = None
+            if sym is not None:
+                q_df = pd.read_sql(
+                    f"""SELECT ts, close FROM ohlcv WHERE symbol_id={sym.id}
+                         AND ts >= %(s)s AND ts <= %(e)s ORDER BY ts""" ,
+                    session.bind,
+                    params={"s": start, "e": end},
+                    parse_dates=["ts"]
+                )
+                if not q_df.empty:
+                    q_df.set_index("ts", inplace=True)
+        if q_df.empty:
+            raise ValueError("No data in range")
         fast_ma = sma(q_df["close"], fast)
         slow_ma = sma(q_df["close"], slow)
-        signal = (fast_ma > slow_ma).astype(int)
+        # detect true cross points（上一根不在同側才算交叉）
+        cross_up = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
+        cross_dn = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
+        # 建立部位：起始空手；金叉=1、死叉=0，其他沿用前一根
+        pos_series = pd.Series(np.nan, index=fast_ma.index, dtype=float)
+        pos_series[cross_up.fillna(False)] = 1
+        pos_series[cross_dn.fillna(False)] = 0
+        if len(pos_series) > 0:
+            pos_series.iloc[0] = 0
+        pos = pos_series.ffill().fillna(0).astype(int)
+
         ret = np.log(q_df["close"]).diff().fillna(0.0)
-        strat_ret = ret * signal.shift(1).fillna(0.0)
+        strat_ret = ret * pos.shift(1).fillna(0.0)
         equity = (1 + strat_ret).cumprod() * cash
+
+        # Events based on position transitions; execute at signal-bar close
+        closes = q_df["close"].astype(float)
+        idx = list(q_df.index)
+        events = []
+        trades_detail = []
+        for i in range(1, len(idx)):
+            prev = int(pos.iloc[i-1])
+            cur = int(pos.iloc[i])
+            if prev == 0 and cur == 1:
+                t = idx[i]
+                events.append({"ts": t.isoformat(), "type": "buy", "price": float(closes.iloc[i])})
+            elif prev == 1 and cur == 0:
+                t = idx[i]
+                events.append({"ts": t.isoformat(), "type": "sell", "price": float(closes.iloc[i])})
+
+        # Pair into trades
+        open_trade = None
+        for ev in events:
+            if ev["type"] == "buy" and open_trade is None:
+                open_trade = {"entry_ts": ev["ts"], "entry_price": ev["price"]}
+            elif ev["type"] == "sell" and open_trade is not None:
+                exit_ts = ev["ts"]
+                exit_price = ev["price"]
+                entry_price = float(open_trade["entry_price"])
+                ret_pct = (exit_price / entry_price) - 1.0
+                trades_detail.append({
+                    "entry_ts": open_trade["entry_ts"],
+                    "entry_price": entry_price,
+                    "exit_ts": exit_ts,
+                    "exit_price": exit_price,
+                    "return": ret_pct,
+                })
+                open_trade = None
 
         report = {
             "symbol": symbol,
@@ -105,7 +147,9 @@ def run_backtest_job(cfg_json: dict):
             "final_equity": float(equity.iloc[-1]),
             "total_return": float(equity.iloc[-1]/cash - 1.0),
             "max_drawdown": float((equity / equity.cummax() - 1.0).min()),
-            "trades": int((signal.diff().abs() == 1).sum() // 2),
+            "trades": int(len(trades_detail)),
+            "events": events,
+            "trades_detail": trades_detail,
         }
 
         jid = get_current_job().id if get_current_job() else None

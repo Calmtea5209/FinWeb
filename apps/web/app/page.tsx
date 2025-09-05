@@ -27,6 +27,7 @@ export default function HomePage() {
   const [symbol, setSymbol] = useState('2330.TW');
   const [range, setRange] = useState<{start?: string; end?: string}>({});
   const [tf, setTf] = useState<'5m'|'15m'|'1h'|'1d'>('1d');
+  const tfRef = useRef<'5m'|'15m'|'1h'|'1d'>(tf);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [minStepSec, setMinStepSec] = useState<number | null>(null);
@@ -48,6 +49,12 @@ export default function HomePage() {
   const simSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const simContainerRef = useRef<HTMLDivElement | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
+  // Pattern modal state
+  const [patOpen, setPatOpen] = useState(false);
+  const [patResult, setPatResult] = useState<any | null>(null);
+  const [patError, setPatError] = useState<string | null>(null);
+  // Selection indices (robust for intraday)
+  const selIdxRef = useRef<{ i1: number | null; i2: number | null }>({ i1: null, i2: null });
   const [showMA20, setShowMA20] = useState(false);
   const [showMA50, setShowMA50] = useState(false);
   const [showVOL, setShowVOL] = useState(false);
@@ -104,10 +111,11 @@ export default function HomePage() {
     return { price, vol, ma20, ma50 } as const;
   };
 
-  // Fetch a daily slice for modal preview
-  const fetchDailySlice = async (sym: string, startIso: string, endIso: string) => {
-    const params = new URLSearchParams({ symbol: sym, tf: '1d', limit: String(2000) });
-    params.set('rng', '5y');
+  // Fetch a slice for modal preview using current timeframe
+  const fetchSlice = async (sym: string, startIso: string, endIso: string, timeframe: '5m'|'15m'|'1h'|'1d') => {
+    const params = new URLSearchParams({ symbol: sym, tf: timeframe, limit: String(2000) });
+    const tfToRange: Record<string,string> = { '5m':'60d', '15m':'60d', '1h':'1y', '1d':'5y' };
+    params.set('rng', tfToRange[timeframe] || '5y');
     const url = `/api/chart/ohlcv_live?${params.toString()}`;
     const r = await fetch(url, { cache: 'no-store', headers: { 'Accept': 'application/json' } });
     if (!r.ok) throw new Error(`GET ${url} failed: HTTP ${r.status}`);
@@ -125,6 +133,10 @@ export default function HomePage() {
     });
     return data;
   };
+
+  useEffect(() => {
+    tfRef.current = tf;
+  }, [tf]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -198,11 +210,43 @@ export default function HomePage() {
         const t1 = toEpochSec(startT);
         const t2 = toEpochSec(param.time as ChartTime);
         if (t1 == null || t2 == null) return;
-        const a = Math.min(t1, t2);
-        const b = Math.max(t1, t2);
-        const iso = (sec:number) => new Date(sec*1000).toISOString().slice(0,10);
-        setRange({ start: iso(a), end: iso(b) });
-        updateHighlight({ start: iso(a), end: iso(b) });
+        let a = Math.min(t1, t2);
+        let b = Math.max(t1, t2);
+        // For intraday, snap to nearest bar time to avoid mismatched seconds
+        if (tf !== '1d') {
+          const bars: any[] = (dataRef.current || []) as any[];
+          const nearest = (sec: number): number => {
+            let best: number = sec; let bestDiff = Number.POSITIVE_INFINITY;
+            for (const d of bars) {
+              if (typeof d.time !== 'number') continue;
+              const s = d.time as number;
+              const diff = Math.abs(s - sec);
+              if (diff < bestDiff) { best = s; bestDiff = diff; if (diff === 0) break; }
+            }
+            return best;
+          };
+          if (bars.length > 0) { a = nearest(a); b = nearest(b); }
+        }
+        const iso = (sec:number) => {
+          // Truncate to whole minutes for intraday to avoid seconds
+          const curTf = tfRef.current;
+          if (curTf === '1d') {
+            const d = new Date(sec*1000);
+            return d.toISOString().slice(0,10); // YYYY-MM-DD
+          }
+          const sTrunc = Math.floor(sec/60) * 60; // drop seconds
+          const d = new Date(sTrunc*1000);
+          return d.toISOString().slice(0,16) + ':00Z'; // YYYY-MM-DDTHH:mm:00Z
+        };
+        const bars = (dataRef.current || []) as any[];
+        const toIdx = (sec:number): number => { let best=0, diff=Number.POSITIVE_INFINITY; for (let i=0;i<bars.length;i++){ const s = typeof bars[i].time === 'number' ? (bars[i].time as number) : Math.floor(Date.UTC(bars[i].time.year, bars[i].time.month-1, bars[i].time.day)/1000); const d=Math.abs(s-sec); if (d<diff){best=i; diff=d; if(d===0) break;} } return best; };
+        const i1 = toIdx(a); const i2 = toIdx(b);
+        selIdxRef.current = { i1: Math.min(i1,i2), i2: Math.max(i1,i2) };
+        const barToIso = (bar:any): string => { if (typeof bar.time === 'number') { const sTr=Math.floor((bar.time as number)/60)*60; const d=new Date(sTr*1000); return d.toISOString().slice(0,16)+':00Z'; } const d=new Date(Date.UTC(bar.time.year, bar.time.month-1, bar.time.day)); return d.toISOString().slice(0,10); };
+        const rs = barToIso(bars[selIdxRef.current.i1!]);
+        const re = barToIso(bars[selIdxRef.current.i2!]);
+        setRange({ start: rs, end: re });
+        updateHighlight();
       }
     });
 
@@ -441,8 +485,10 @@ export default function HomePage() {
 
   // Helper: convert ISO to Time based on tf
   const isoToTime = (iso: string): any => {
-    const d = new Date(iso + 'T00:00:00Z');
-    if (tf === '1d') {
+    // Supports either date-only (YYYY-MM-DD) or full ISO with time
+    const hasTime = iso.includes('T');
+    const d = hasTime ? new Date(iso) : new Date(iso + 'T00:00:00Z');
+    if (tf === '1d' || (!hasTime && tf === '1d')) {
       return { year: d.getUTCFullYear(), month: d.getUTCMonth()+1, day: d.getUTCDate() } as any;
     }
     return Math.floor(d.getTime()/1000) as UTCTimestamp;
@@ -454,6 +500,33 @@ export default function HomePage() {
     const chart = chartRef.current;
     const series = seriesRef.current;
     if (!ov || !chart || !series) return;
+    const bars = (dataRef.current || []) as any[];
+    if (bars.length && selIdxRef.current.i1 != null && selIdxRef.current.i2 != null) {
+      const i1 = Math.max(0, Math.min(bars.length-1, selIdxRef.current.i1!));
+      const i2 = Math.max(0, Math.min(bars.length-1, selIdxRef.current.i2!));
+      const a = Math.min(i1,i2), b = Math.max(i1,i2);
+      const x1c = chart.timeScale().timeToCoordinate(bars[a].time);
+      const x2c = chart.timeScale().timeToCoordinate(bars[b].time);
+      if (x1c == null || x2c == null) { ov.style.display='none'; return; }
+      let leftOffset = 0; try { const lps:any=(chart as any).priceScale? (chart as any).priceScale('left'):null; const w=lps&&typeof lps.width==='function'? lps.width():0; if(Number.isFinite(w)) leftOffset=w; } catch {}
+      const coord = (idx:number)=> chart.timeScale().timeToCoordinate(bars[idx].time)!;
+      const half1 = a>0? Math.abs(coord(a)-coord(a-1))/2 : (a+1<bars.length? Math.abs(coord(a+1)-coord(a))/2:2);
+      const half2 = b+1<bars.length? Math.abs(coord(b+1)-coord(b))/2 : (b>0? Math.abs(coord(b)-coord(b-1))/2:2);
+      // Align box to centers of first and last selected bars
+      const left = Math.min(x1c, x2c) + leftOffset;
+      const width = Math.max(2, Math.abs(x2c - x1c));
+      let hi=-Infinity, lo=Infinity; for(let i=a;i<=b;i++){ const d=bars[i]; if(d.high>hi) hi=d.high; if(d.low<lo) lo=d.low; }
+      if (!Number.isFinite(hi) || !Number.isFinite(lo)) { ov.style.display='none'; return; }
+      const pad=Math.max((hi-lo)*0.04,(hi+lo)*0.0005); const yTop=series.priceToCoordinate(hi+pad); const yBot=series.priceToCoordinate(lo-pad);
+      if (yTop==null||yBot==null) { ov.style.display='none'; return; }
+      const top=Math.min(yTop,yBot); const bottomCoord=Math.max(yTop,yBot); const containerH=containerRef.current?.clientHeight ?? 0; const bottomPx=Math.max(0, containerH-bottomCoord);
+      ov.style.display='block';
+      ov.style.left = `${Math.round(left)}px`;
+      ov.style.width = `${Math.round(width)}px`;
+      ov.style.top = `${Math.round(top)}px`;
+      ov.style.bottom = `${Math.round(bottomPx)}px`;
+      return;
+    }
     const rs = (r?.start ?? range.start);
     const re = (r?.end ?? range.end);
     if (!rs || !re) { ov.style.display = 'none'; return; }
@@ -470,12 +543,17 @@ export default function HomePage() {
         const w = lps && typeof lps.width === 'function' ? lps.width() : 0;
         if (Number.isFinite(w)) leftOffset = w;
       } catch {}
+      // Align box to centers of the two selected times
       const left = Math.min(x1, x2) + leftOffset;
       const width = Math.max(2, Math.abs(x2 - x1));
 
       // compute vertical bounds
-      const sMs = new Date(rs + 'T00:00:00Z').getTime();
-      const eMs = new Date(re + 'T00:00:00Z').getTime();
+      const parseMs = (s: string|undefined): number => {
+        if (!s) return NaN as any;
+        return new Date(s.includes('T') ? s : (s + 'T00:00:00Z')).getTime();
+      };
+      const sMs = parseMs(rs);
+      const eMs = parseMs(re);
       let hi = Number.NEGATIVE_INFINITY, lo = Number.POSITIVE_INFINITY;
       for (const d of (dataRef.current || [])) {
         let tms: number | null = null;
@@ -532,9 +610,39 @@ export default function HomePage() {
       simSeriesRef.current = chart.addCandlestickSeries({ upColor:'#16a34a', downColor:'#ef4444', wickUpColor:'#16a34a', wickDownColor:'#ef4444', borderUpColor:'#16a34a', borderDownColor:'#ef4444' });
     }
 
+    // apply intraday x-axis formatting similar to main chart
+    try {
+      const isDaily = tfRef.current === '1d';
+      const fmtTick = (time: any, markType?: TickMarkType) => {
+        let ms: number;
+        if (typeof time === 'number') {
+          ms = time * 1000;
+        } else if (time && typeof time === 'object' && 'year' in time) {
+          ms = Date.UTC(time.year as number, (time.month as number) - 1, time.day as number);
+        } else {
+          return '';
+        }
+        const d = new Date(ms);
+        if (!isDaily) {
+          const md = new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' }).format(d).replace(/\s/g, '');
+          const hm = new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', hour12: false, hour: '2-digit', minute: '2-digit' }).format(d);
+          return `${md} ${hm}`;
+        }
+        return new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', month: 'numeric', day: 'numeric' }).format(d).replace(/\s/g, '');
+      };
+      chart.applyOptions({
+        timeScale: {
+          borderColor: '#cbd5e1',
+          timeVisible: tfRef.current !== '1d',
+          secondsVisible: false,
+          tickMarkFormatter: fmtTick as any,
+        },
+      });
+    } catch {}
+
     // fetch data
     setError(null);
-    fetchDailySlice(item.symbol, item.start_time, item.end_time)
+    fetchSlice(item.symbol, item.start_time, item.end_time, tfRef.current)
       .then(data => {
         simSeriesRef.current?.setData(data);
         simChartRef.current?.timeScale().fitContent();
@@ -649,15 +757,14 @@ export default function HomePage() {
       alert('請先在圖上點兩下選取起訖（第一次點＝起點；第二次點＝終點）');
       return;
     }
-    const m = 30;
-    // Quick client-side validation to reduce 400s
+    // 動態決定 m：不限制天數，依選取區間長度自適應（最少3，最多60）
+    let m = 30;
     try {
       const start = new Date(range.start);
       const end = new Date(range.end);
       const approxDays = Math.max(0, Math.round((+end - +start) / 86400000));
-      if (approxDays < m + 2) {
-        alert(`選取區間太短，請至少選取約 ${m + 2} 個交易日（目前約 ${approxDays} 天）`);
-        return;
+      if (Number.isFinite(approxDays) && approxDays > 0) {
+        m = Math.max(3, Math.min(60, approxDays - 1));
       }
     } catch {}
     try {
@@ -666,7 +773,7 @@ export default function HomePage() {
       const res = await fetch(url, {
         method: 'POST',
         headers: {'Content-Type':'application/json','Accept':'application/json'},
-        body: JSON.stringify({ symbol, start: range.start, end: range.end, m, top: 5, universe: symbols })
+        body: JSON.stringify({ symbol, start: range.start, end: range.end, m, top: 5, universe: symbols, tf })
       });
       if (!res.ok) {
         const text = await res.text().catch(() => '');
@@ -688,7 +795,9 @@ export default function HomePage() {
 
   const onDetectPattern = async () => {
     if (!range.start || !range.end) {
-      alert('請先在圖上點兩下選取起訖（第一次點＝起點；第二次點＝終點）');
+      setPatResult(null);
+      setPatError('請先在圖上點兩下選取起訖（第一次點＝起點；第二次點＝終點）');
+      setPatOpen(true);
       return;
     }
     try {
@@ -703,16 +812,14 @@ export default function HomePage() {
         throw new Error(`POST ${url} failed: HTTP ${res.status}${text ? ` - ${text}` : ''}`);
       }
       const j = await res.json();
-      const nameMap: Record<string,string> = {
-        sym_triangle: '對稱三角形',
-        asc_triangle: '上升三角形',
-        desc_triangle: '下降三角形',
-        unknown: '未辨識/非三角形'
-      };
-      alert(`型態辨識：${nameMap[j.label] || j.label}\n信心：${(j.confidence*100).toFixed(0)}%\n詳細：\n- 高點斜率: ${j.meta?.slope_high?.toFixed?.(6)}\n- 低點斜率: ${j.meta?.slope_low?.toFixed?.(6)}\n- R2(高/低): ${j.meta?.r2_high?.toFixed?.(2)} / ${j.meta?.r2_low?.toFixed?.(2)}\n- 範圍收斂比: ${j.meta?.contraction?.toFixed?.(2)}`);
+      setPatError(null);
+      setPatResult(j);
+      setPatOpen(true);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      alert('型態辨識失敗：\n' + msg);
+      setPatResult(null);
+      setPatError('型態辨識失敗：\n' + msg);
+      setPatOpen(true);
     }
   };
 
@@ -766,6 +873,46 @@ export default function HomePage() {
             </div>
             <div className="modal-footer">
               <button className="btn" onClick={()=>setSimOpen(false)}>關閉</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {patOpen && (
+        <div className="modal-overlay" onMouseDown={(e)=>{ if (e.target === e.currentTarget) setPatOpen(false); }}>
+          <div className="modal" role="dialog" aria-modal="true" aria-label="型態辨識結果">
+            <div className="modal-header">型態辨識</div>
+            <div className="modal-body">
+              {patError ? (
+                <div style={{whiteSpace:'pre-wrap'}}>{patError}</div>
+              ) : (
+                (()=>{
+                  const j = patResult || {} as any;
+                  const nameMap: Record<string,string> = {
+                    sym_triangle: '對稱三角形',
+                    asc_triangle: '上升三角形',
+                    desc_triangle: '下降三角形',
+                    unknown: '未辨識/非三角形'
+                  };
+                  const label = nameMap[j.label] || j.label || '—';
+                  const conf = j.confidence!=null ? Math.round(j.confidence*100) : null;
+                  const meta = j.meta || {};
+                  return (
+                    <div className="sent-card">
+                      <div className="sent-title">{label}（{tfLabels[(j.tf || tf) as string] || (j.tf || tf)}）</div>
+                      <div className="sent-metrics">
+                        <div className="sent-kv"><span>信心</span><span>{conf!=null? conf: '—'}%</span></div>
+                        <div className="sent-kv"><span>高點斜率</span><span>{meta.slope_high!=null ? Number(meta.slope_high).toFixed(6) : '—'}</span></div>
+                        <div className="sent-kv"><span>低點斜率</span><span>{meta.slope_low!=null ? Number(meta.slope_low).toFixed(6) : '—'}</span></div>
+                        <div className="sent-kv"><span>R2(高/低)</span><span>{meta.r2_high!=null ? Number(meta.r2_high).toFixed(2) : '—'} / {meta.r2_low!=null ? Number(meta.r2_low).toFixed(2) : '—'}</span></div>
+                        <div className="sent-kv"><span>範圍收斂比</span><span>{meta.contraction!=null ? Number(meta.contraction).toFixed(2) : '—'}</span></div>
+                      </div>
+                    </div>
+                  );
+                })()
+              )}
+            </div>
+            <div className="modal-footer">
+              <button className="btn" onClick={()=>setPatOpen(false)}>關閉</button>
             </div>
           </div>
         </div>
@@ -863,7 +1010,20 @@ export default function HomePage() {
         <div className="alert" suppressHydrationWarning>錯誤：{error}</div>
       )}
       <div className="info" suppressHydrationWarning>
-        API：{API}　|　TF：{tf}　|　範圍：{rangeLabel || '—'}　|　選取區間：{range.start || '—'} ~ {range.end || '—'}
+        {(() => {
+          const fmtDate = new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit' });
+          const fmtDateTime = new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit', hour12: false, hour: '2-digit', minute: '2-digit' });
+          const show = (s?: string | null) => {
+            if (!s) return '—';
+            if (s.includes('T')) { const d = new Date(s); return fmtDateTime.format(d).replaceAll('/', '-'); }
+            const d = new Date(s + 'T00:00:00Z'); return fmtDate.format(d).replaceAll('/', '-');
+          };
+          return (
+            <>
+              API：{API}　|　TF：{tf}　|　範圍：{rangeLabel || '—'}　|　選取區間：{show(range.start)} ~ {show(range.end)}
+            </>
+          );
+        })()}
       </div>
       <div className="sentiment">
         <div className="sent-card">

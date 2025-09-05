@@ -421,9 +421,12 @@ def similar(req: SimilarSearchRequest, db: Session | None = Depends(get_db_safe)
         df = pd.DataFrame(rows).sort_values("ts").set_index("ts")
         return df
 
-    # Try DB first if symbol exists in DB
+    # Determine interval/range based on requested timeframe
+    tf = getattr(req, 'tf', '1d') or '1d'
+    interval, default_range = _tf_to_yahoo(tf)
+    # Try DB first only for daily timeframe; for intraday, use Yahoo to ensure matching resolution
     qdf = pd.DataFrame()
-    if sym is not None:
+    if sym is not None and tf == '1d':
         qdf = pd.read_sql(
             f"""SELECT ts, close FROM ohlcv WHERE symbol_id={sym.id}
                  AND ts >= %(s)s AND ts <= %(e)s ORDER BY ts""",
@@ -436,26 +439,35 @@ def similar(req: SimilarSearchRequest, db: Session | None = Depends(get_db_safe)
             except Exception:
                 pass
 
-    # Fallback to Yahoo if DB has no/insufficient data
-    if qdf.empty or len(qdf) < req.m + 2:
+    # Fallback to Yahoo if DB has no data or timeframe is intraday
+    if qdf.empty:
         try:
-            full = yahoo_df(req.symbol, interval="1d", y_range="10y")
+            # Use longer ranges for daily, Yahoo-limited ranges for intraday
+            y_range = "10y" if interval == "1d" else default_range
+            full = yahoo_df(req.symbol, interval=interval, y_range=y_range)
         except httpx.HTTPError as e:
             raise HTTPException(502, f"upstream fetch failed: {e}")
         # Ensure both sides are UTC-aware for comparison
         start_utc = pd.to_datetime(req.start, utc=True)
         end_utc = pd.to_datetime(req.end, utc=True)
         qdf = full[(full.index >= start_utc) & (full.index <= end_utc)]
-        if qdf.empty or len(qdf) < req.m + 2:
+        if qdf.empty:
             raise HTTPException(400, "query segment too short / no data")
 
+    # Choose an effective window length m based on available data (no hard minimum days from client)
+    m_req = int(getattr(req, 'm', 30) or 30)
+    n = int(len(qdf))
+    if n < 3:
+        raise HTTPException(400, "query segment too short / no data")
+    m_eff = max(3, min(m_req, n - 1))
+
     # Build query vector (last m returns inside selected window)
-    q_ret = to_returns(qdf["close"])[-req.m:]
+    q_ret = to_returns(qdf["close"])[-m_eff:]
     zq = z_norm(q_ret)
     # Determine query start/end timestamps for overlap filtering
     try:
         q_end_ts = qdf.index[-1]
-        q_start_ts = qdf.index[-req.m]
+        q_start_ts = qdf.index[-m_eff]
     except Exception:
         q_start_ts = qdf.index[0]
         q_end_ts = qdf.index[-1]
@@ -484,7 +496,7 @@ def similar(req: SimilarSearchRequest, db: Session | None = Depends(get_db_safe)
     cutoff_utc = pd.Timestamp.now(tz='UTC') - pd.DateOffset(years=int(lookback_years))
 
     for code in codes:
-        if db_symbols:
+        if db_symbols and tf == '1d':
             s = next((x for x in db_symbols if x.code == code), None)
             if s is not None:
                 sdf = pd.read_sql(
@@ -505,7 +517,9 @@ def similar(req: SimilarSearchRequest, db: Session | None = Depends(get_db_safe)
         else:
             # Yahoo fallback for target universe
             try:
-                sdf = yahoo_df(code, interval="1d", y_range="10y")
+                # Use longer ranges for daily, Yahoo-limited ranges for intraday
+                y_range = "10y" if interval == "1d" else default_range
+                sdf = yahoo_df(code, interval=interval, y_range=y_range)
             except httpx.HTTPError:
                 continue
         if not sdf.empty:
@@ -513,19 +527,19 @@ def similar(req: SimilarSearchRequest, db: Session | None = Depends(get_db_safe)
                 sdf = sdf[sdf.index >= cutoff_utc]
             except Exception:
                 pass
-        if len(sdf) < req.m + 10:
+        if len(sdf) < m_eff:
             continue
-        s_ret = to_returns(sdf["close"])
-        D = sliding_zdist(zq, s_ret, req.m)
+        s_ret = to_returns(sdf["close"]) 
+        D = sliding_zdist(zq, s_ret, m_eff)
         if D.size == 0:
             continue
         k = min(req.top, len(D))
         idx = np.argpartition(D, k-1)[:k]
         idx = idx[np.argsort(D[idx])]
         for i in idx:
-            end_pos = i + req.m - 1
+            end_pos = i + m_eff - 1
             start_ts = sdf.index[i+1]
-            end_ts = sdf.index[i+req.m]
+            end_ts = sdf.index[i+m_eff]
             closes = sdf["close"].values
             # Skip trivial self-matches that overlap the query window when searching within the same symbol
             if code == req.symbol:
@@ -543,7 +557,7 @@ def similar(req: SimilarSearchRequest, db: Session | None = Depends(get_db_safe)
                 "forward": {"1": fwd(1), "5": fwd(5), "20": fwd(20)}
             })
     results.sort(key=lambda x: x["distance"])
-    return {"items": results[:req.top]}
+    return {"items": results[:req.top], "m_used": m_eff}
 
 # --- Pattern classification (triangles) ---
 def _yahoo_ohlc_df(symbol: str, interval: str = "1d", y_range: str = "5y") -> pd.DataFrame:
@@ -710,9 +724,12 @@ class PatternRequest(BaseModel):
 
 @app.post("/pattern/classify")
 def pattern_classify(req: PatternRequest):
-    # Fetch daily OHLC between start/end (from Yahoo)
+    # Fetch OHLC between start/end with the same timeframe as request
+    interval, default_range = _tf_to_yahoo(getattr(req, 'tf', '1d'))
+    # For daily use a long range to ensure coverage, intraday limited by Yahoo
+    y_range = "10y" if interval == "1d" else default_range
     try:
-        full = _yahoo_ohlc_df(req.symbol, interval="1d", y_range="10y")
+        full = _yahoo_ohlc_df(req.symbol, interval=interval, y_range=y_range)
     except httpx.HTTPError as e:
         raise HTTPException(502, f"upstream fetch failed: {e}")
     if full.empty:
@@ -723,7 +740,7 @@ def pattern_classify(req: PatternRequest):
     if len(df) < 20:
         raise HTTPException(400, "window too short (min 20 bars)")
     label, conf, meta = _detect_triangle(df)
-    return {"symbol": req.symbol, "start": req.start, "end": req.end, "label": label, "confidence": conf, "meta": meta}
+    return {"symbol": req.symbol, "start": req.start, "end": req.end, "tf": getattr(req, 'tf', '1d'), "label": label, "confidence": conf, "meta": meta}
 
 # --- Sentiment summary ---
 def _rsi(series: pd.Series, n: int = 14) -> pd.Series:

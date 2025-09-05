@@ -15,6 +15,8 @@ class SimilarSearchRequest(BaseModel):
     universe: Optional[List[str]] = None
     # Only consider candidate matches within the last N years (relative to now)
     lookback_years: Optional[int] = 5
+    # Timeframe of the query window, e.g., '5m','15m','1h','1d'
+    tf: Optional[str] = "1d"
 
 class BacktestConfig(BaseModel):
     symbol: str

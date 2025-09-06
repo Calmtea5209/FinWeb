@@ -24,7 +24,7 @@ export default function HomePage() {
     .split(',').map(s=>s.trim()).filter(Boolean);
   const [symbols, setSymbols] = useState<string[]>(defaultSymbols);
   const [newSym, setNewSym] = useState('');
-  const [symbol, setSymbol] = useState('2330.TW');
+  const [symbol, setSymbol] = useState<string>('2330.TW');
   const [range, setRange] = useState<{start?: string; end?: string}>({});
   const [tf, setTf] = useState<'5m'|'15m'|'1h'|'1d'>('1d');
   const tfRef = useRef<'5m'|'15m'|'1h'|'1d'>(tf);
@@ -49,6 +49,9 @@ export default function HomePage() {
   const simSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const simContainerRef = useRef<HTMLDivElement | null>(null);
   const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
+  const [authReady, setAuthReady] = useState(false);
+  const [canPersist, setCanPersist] = useState(false);
   // Pattern modal state
   const [patOpen, setPatOpen] = useState(false);
   const [patResult, setPatResult] = useState<any | null>(null);
@@ -285,31 +288,103 @@ export default function HomePage() {
     let cancelled = false;
     fetch('/api/auth/me', { cache: 'no-store' })
       .then(async r => {
-        if (!r.ok) return;
+        if (!r.ok) { if (!cancelled) { setUserEmail(null); setIsLoggedIn(false); try { localStorage.removeItem('finlab_logged_in'); } catch {} } return; }
         const j = await r.json();
-        if (!cancelled) setUserEmail(j?.email || null);
+        if (!cancelled) { setUserEmail(j?.email || null); setIsLoggedIn(true); try { localStorage.setItem('finlab_logged_in','1'); } catch {} }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setAuthReady(true); });
     return () => { cancelled = true; };
   }, []);
 
-  // Load/save custom symbols list from localStorage
+  // Load/reset preferences based on auth status
   useEffect(() => {
+    let cancelled = false;
+    const resetDefaults = () => {
+      if (cancelled) return;
+      setSymbols(defaultSymbols);
+      setSymbol(defaultSymbols[0] || '');
+      setShowMA20(false);
+      setShowMA50(false);
+      setShowVOL(false);
+      setCanPersist(false);
+    };
+    if (!authReady) { return; }
+    if (!isLoggedIn) { // guest: reset on each visit/reload
+      resetDefaults();
+      return;
+    }
+    // logged-in: first apply local cached prefs (warm start), then fetch from server
     try {
-      const saved = localStorage.getItem('finlab_symbols');
-      if (saved) {
-        const arr = JSON.parse(saved);
-        if (Array.isArray(arr) && arr.every(x => typeof x === 'string')) {
-          setSymbols(Array.from(new Set(arr)) as string[]);
-          if (!arr.includes(symbol) && arr.length > 0) setSymbol(arr[0]);
+      const rawSyms = localStorage.getItem('finlab_symbols');
+      if (rawSyms) {
+        const arr = JSON.parse(rawSyms);
+        if (Array.isArray(arr) && arr.every((x:any)=>typeof x==='string')) {
+          const uniq = Array.from(new Set(arr));
+          setSymbols(uniq.length ? uniq : defaultSymbols);
+          const chosen = localStorage.getItem('finlab_symbol_selected');
+          if (chosen && uniq.includes(chosen)) setSymbol(chosen);
+          else if (uniq.length && !uniq.includes(symbol)) setSymbol(uniq[0]);
+        }
+      }
+      const rawInd = localStorage.getItem('finlab_indicators');
+      if (rawInd) {
+        const obj = JSON.parse(rawInd || 'null');
+        if (obj && typeof obj === 'object') {
+          setShowMA20(!!obj.ma20); setShowMA50(!!obj.ma50); setShowVOL(!!obj.vol);
         }
       }
     } catch {}
+    (async () => {
+      try {
+        const r = await fetch('/api/user/prefs', { cache: 'no-store' });
+        if (!r.ok) { /* keep local cached values to avoid flicker */ return; }
+        const j = await r.json();
+        if (cancelled) return;
+        const syms = Array.isArray(j.symbols) ? j.symbols.filter((x:any) => typeof x === 'string') : [];
+        const uniq = Array.from(new Set(syms));
+        setSymbols(uniq.length ? uniq : defaultSymbols);
+        if (uniq.length) {
+          if (!uniq.includes(symbol)) setSymbol(uniq[0]);
+        } else {
+          setSymbol(defaultSymbols[0] || '');
+        }
+        const ind = (j.indicators || {}) as any;
+        setShowMA20(!!ind.ma20);
+        setShowMA50(!!ind.ma50);
+        setShowVOL(!!ind.vol);
+      } catch { /* ignore to keep current state */ }
+      finally { if (!cancelled) setCanPersist(true); }
+    })();
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [isLoggedIn, authReady]);
+
+  // Persist preferences when logged in and after initial load
   useEffect(() => {
+    if (!isLoggedIn || !canPersist) return; // do not persist until ready
+    const payload = { symbols, indicators: { ma20: showMA20, ma50: showMA50, vol: showVOL } };
+    try {
+      fetch('/api/user/prefs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).catch(()=>{});
+    } catch {}
+  }, [symbols, showMA20, showMA50, showVOL, isLoggedIn]);
+
+  // Also cache indicators locally when logged in (warm start to avoid flicker on next reload)
+  useEffect(() => {
+    if (!isLoggedIn || !canPersist) return;
+    try { localStorage.setItem('finlab_indicators', JSON.stringify({ ma20: showMA20, ma50: showMA50, vol: showVOL })); } catch {}
+  }, [showMA20, showMA50, showVOL, isLoggedIn, canPersist]);
+
+  // Cache symbols and selected symbol locally when logged in for warm start
+  useEffect(() => {
+    if (!isLoggedIn || !canPersist) return;
     try { localStorage.setItem('finlab_symbols', JSON.stringify(symbols)); } catch {}
-  }, [symbols]);
+  }, [symbols, isLoggedIn, canPersist]);
+
+  useEffect(() => {
+    if (!isLoggedIn || !canPersist) return;
+    try { if (symbol) localStorage.setItem('finlab_symbol_selected', symbol); } catch {}
+  }, [symbol, isLoggedIn, canPersist]);
 
   useEffect(() => {
     const onDoc = (e: MouseEvent) => {
@@ -828,10 +903,22 @@ export default function HomePage() {
       <div className="header" suppressHydrationWarning>
         <h1 className="title">FinLab</h1>
         <div style={{marginLeft:'auto', display:'flex', gap:8, alignItems:'center'}}>
-          {userEmail ? (
+          {isLoggedIn ? (
             <>
-              <span className="badge" title={userEmail}>{userEmail}</span>
-              <button className="btn" onClick={async()=>{ try { await fetch('/api/auth/logout',{method:'POST'}); setUserEmail(null); } catch {} }}>登出</button>
+              <span className="badge" title={userEmail || ''}>{userEmail || '…'}</span>
+              <button className="btn" onClick={async()=>{
+                try { await fetch('/api/auth/logout',{method:'POST'}); } catch {}
+                // Reset local UI state when logging out
+                setUserEmail(null);
+                setIsLoggedIn(false);
+                setSymbols(defaultSymbols);
+                setSymbol(defaultSymbols[0] || '');
+                setShowMA20(false);
+                setShowMA50(false);
+                setShowVOL(false);
+                // Keep local caches for seamless restore on next login; only drop the logged-in marker
+                try { localStorage.removeItem('finlab_logged_in'); } catch {}
+              }}>登出</button>
             </>
           ) : (
             <>

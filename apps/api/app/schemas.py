@@ -54,3 +54,14 @@ class AuthToken(BaseModel):
     token_type: str = "bearer"
     expires_at: Optional[str] = None  # ISO
     user: UserOut
+
+
+# --- User preferences ---
+class UserPrefsIn(BaseModel):
+    symbols: Optional[List[str]] = None
+    indicators: Optional[Dict[str, bool]] = None
+
+
+class UserPrefsOut(BaseModel):
+    symbols: List[str] = []
+    indicators: Dict[str, bool] = {}

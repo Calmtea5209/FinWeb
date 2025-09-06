@@ -52,3 +52,13 @@ class BacktestRun(Base):
     report_json = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class UserPrefs(Base):
+    __tablename__ = "user_prefs"
+    # One row per user
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    symbols = Column(JSON, nullable=True)
+    indicators = Column(JSON, nullable=True)  # e.g., { ma20: bool, ma50: bool, vol: bool }
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

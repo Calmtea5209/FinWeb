@@ -8,8 +8,8 @@ import numpy as np
 from datetime import datetime
 
 from .db import Base, engine, get_db, get_db_safe
-from .models import User, UserAuth, Symbol, OHLCV, BacktestRun
-from .schemas import IndicatorRequest, SimilarSearchRequest, BacktestSubmitRequest, AuthRegister, AuthLogin, AuthToken, UserOut
+from .models import User, UserAuth, Symbol, OHLCV, BacktestRun, UserPrefs
+from .schemas import IndicatorRequest, SimilarSearchRequest, BacktestSubmitRequest, AuthRegister, AuthLogin, AuthToken, UserOut, UserPrefsIn, UserPrefsOut
 from .indicators import compute_indicators
 from .utils import to_returns, z_norm, sliding_zdist
 from .tasks import enqueue_backtest
@@ -123,6 +123,65 @@ def _user_from_auth_header(authorization: str | None, db: Session) -> User:
 def auth_me(Authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
     u = _user_from_auth_header(Authorization, db)
     return UserOut(id=u.id, email=u.email, tz=u.tz)
+
+
+# --- User preferences ---
+@app.get("/user/prefs", response_model=UserPrefsOut)
+def get_user_prefs(Authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
+    u = _user_from_auth_header(Authorization, db)
+    up = db.query(UserPrefs).filter(UserPrefs.user_id == u.id).first()
+    symbols = up.symbols if (up and isinstance(up.symbols, list)) else []
+    indicators = up.indicators if (up and isinstance(up.indicators, dict)) else {}
+    # sanitize indicators to expected keys
+    sanitized = {
+        "ma20": bool(indicators.get("ma20", False)) if isinstance(indicators, dict) else False,
+        "ma50": bool(indicators.get("ma50", False)) if isinstance(indicators, dict) else False,
+        "vol": bool(indicators.get("vol", False)) if isinstance(indicators, dict) else False,
+    }
+    # cap symbols length and ensure strings
+    symbols_out = [str(s).strip() for s in symbols if isinstance(s, str) and str(s).strip()][:100]
+    return UserPrefsOut(symbols=symbols_out, indicators=sanitized)
+
+
+@app.post("/user/prefs", response_model=UserPrefsOut)
+def set_user_prefs(req: UserPrefsIn, Authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
+    u = _user_from_auth_header(Authorization, db)
+    up = db.query(UserPrefs).filter(UserPrefs.user_id == u.id).first()
+    created = False
+    if not up:
+        up = UserPrefs(user_id=u.id, symbols=[], indicators={})
+        db.add(up)
+        created = True
+    # Update fields if provided
+    if req.symbols is not None:
+        try:
+            syms = [str(s).strip() for s in (req.symbols or []) if isinstance(s, str) and str(s).strip()]
+            up.symbols = syms[:100]
+        except Exception:
+            up.symbols = []
+    if req.indicators is not None:
+        inds = req.indicators or {}
+        up.indicators = {
+            "ma20": bool(inds.get("ma20", False)),
+            "ma50": bool(inds.get("ma50", False)),
+            "vol": bool(inds.get("vol", False)),
+        }
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    if created:
+        db.refresh(up)
+    # Return sanitized
+    return UserPrefsOut(
+        symbols=[str(s).strip() for s in (up.symbols or []) if isinstance(s, str) and str(s).strip()][:100],
+        indicators={
+            "ma20": bool((up.indicators or {}).get("ma20", False)),
+            "ma50": bool((up.indicators or {}).get("ma50", False)),
+            "vol": bool((up.indicators or {}).get("vol", False)),
+        },
+    )
 
 @app.get("/health")
 def health():

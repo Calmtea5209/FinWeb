@@ -139,7 +139,7 @@ select::-ms-expand { display: none; }
   padding: 12px;
   margin-bottom: 8px; /* bring info closer to chart */
 }
-.chart { width: 100%; height: 560px; border-radius: 8px; }
+.chart { width: 100%; height: 460; border-radius: 8px; }
 /* Hide TradingView attribution inside our chart containers */
 .chart a#tv-attr-logo, .mini-chart a#tv-attr-logo { display: none !important; }
 

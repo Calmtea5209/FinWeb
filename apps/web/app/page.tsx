@@ -37,8 +37,6 @@ export default function HomePage() {
   const [tfOpen, setTfOpen] = useState(false);
   const tfMenuRef = useRef<HTMLDivElement | null>(null);
   const tfLabels: Record<string,string> = { '5m':'5 分鐘', '15m':'15 分鐘', '1h':'1 小時', '1d':'1 天' };
-  const [sentSym, setSentSym] = useState<{label:string; score:number; rsi14:number; slope_norm:number; vol:number} | null>(null);
-  const [sentEnv, setSentEnv] = useState<{label:string; pct_above_ma50:number; pct_above_ma20:number; avg_rsi:number; universe_size:number} | null>(null);
   const [newsSym, setNewsSym] = useState<Array<{title:string; url:string; publisher?:string; published_at?:string}>>([]);
   const [newsMkt, setNewsMkt] = useState<Array<{title:string; url:string; publisher?:string; published_at?:string}>>([]);
   const [simOpen, setSimOpen] = useState(false);
@@ -52,10 +50,6 @@ export default function HomePage() {
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
   const [authReady, setAuthReady] = useState(false);
   const [canPersist, setCanPersist] = useState(false);
-  // Pattern modal state
-  const [patOpen, setPatOpen] = useState(false);
-  const [patResult, setPatResult] = useState<any | null>(null);
-  const [patError, setPatError] = useState<string | null>(null);
   // Selection indices (robust for intraday)
   const selIdxRef = useRef<{ i1: number | null; i2: number | null }>({ i1: null, i2: null });
   const [showMA20, setShowMA20] = useState(false);
@@ -144,7 +138,7 @@ export default function HomePage() {
   useEffect(() => {
     if (!containerRef.current) return;
     const chart = createChart(containerRef.current, {
-      height: 560,
+      height: 460,
       layout: { background: { type: ColorType.Solid, color: 'transparent' }, textColor: '#334155' },
       grid: { vertLines: { color: '#e2e8f0' }, horzLines: { color: '#e2e8f0' } },
       rightPriceScale: { borderColor: '#cbd5e1' },
@@ -399,34 +393,15 @@ export default function HomePage() {
   // Live data: no DB meta; clear any previous state
   useEffect(() => { setMinStepSec(null); }, [symbol]);
 
-  // Fetch sentiment when symbol or universe changes (daily-based)
+  // Fetch news when symbol or universe changes
   useEffect(() => {
     let cancelled = false;
     const run = async () => {
-      if (!symbol.trim()) { setSentSym(null); setSentEnv(null); return; }
-      try {
-        const r = await fetch('/api/sentiment/summary', {
-          method: 'POST', headers: { 'Content-Type':'application/json' },
-          body: JSON.stringify({ symbol, universe: symbols })
-        });
-        if (!r.ok) return;
-        const j = await r.json();
-        if (cancelled) return;
-        setSentSym({
-          label: j.symbol_sentiment?.label,
-          score: j.symbol_sentiment?.score ?? 0,
-          rsi14: j.symbol_sentiment?.rsi14 ?? 0,
-          slope_norm: j.symbol_sentiment?.slope_norm ?? 0,
-          vol: j.symbol_sentiment?.vol ?? 0,
-        });
-        setSentEnv({
-          label: j.environment_sentiment?.label,
-          pct_above_ma50: j.environment_sentiment?.pct_above_ma50 ?? 0,
-          pct_above_ma20: j.environment_sentiment?.pct_above_ma20 ?? 0,
-          avg_rsi: j.environment_sentiment?.avg_rsi ?? 0,
-          universe_size: j.environment_sentiment?.universe_size ?? symbols.length,
-        });
-      } catch {}
+      if (!symbol.trim()) {
+        setNewsSym([]);
+        setNewsMkt([]);
+        return;
+      }
       try {
         const r2 = await fetch('/api/news/summary', {
           method: 'POST', headers: { 'Content-Type':'application/json' },
@@ -444,6 +419,7 @@ export default function HomePage() {
     run();
     return () => { cancelled = true; };
   }, [symbol, symbols]);
+
 
   // Auto refresh to keep latest candle updated
   const refreshMs = useMemo(() => {
@@ -868,36 +844,6 @@ export default function HomePage() {
     }
   };
 
-  const onDetectPattern = async () => {
-    if (!range.start || !range.end) {
-      setPatResult(null);
-      setPatError('請先在圖上點兩下選取起訖（第一次點＝起點；第二次點＝終點）');
-      setPatOpen(true);
-      return;
-    }
-    try {
-      const url = `/api/pattern/classify`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ symbol, start: range.start, end: range.end, tf }),
-      });
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`POST ${url} failed: HTTP ${res.status}${text ? ` - ${text}` : ''}`);
-      }
-      const j = await res.json();
-      setPatError(null);
-      setPatResult(j);
-      setPatOpen(true);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setPatResult(null);
-      setPatError('型態辨識失敗：\n' + msg);
-      setPatOpen(true);
-    }
-  };
-
   return (
     <main className="app" suppressHydrationWarning>
       <div className="header" suppressHydrationWarning>
@@ -964,46 +910,6 @@ export default function HomePage() {
           </div>
         </div>
       )}
-      {patOpen && (
-        <div className="modal-overlay" onMouseDown={(e)=>{ if (e.target === e.currentTarget) setPatOpen(false); }}>
-          <div className="modal" role="dialog" aria-modal="true" aria-label="型態辨識結果">
-            <div className="modal-header">型態辨識</div>
-            <div className="modal-body">
-              {patError ? (
-                <div style={{whiteSpace:'pre-wrap'}}>{patError}</div>
-              ) : (
-                (()=>{
-                  const j = patResult || {} as any;
-                  const nameMap: Record<string,string> = {
-                    sym_triangle: '對稱三角形',
-                    asc_triangle: '上升三角形',
-                    desc_triangle: '下降三角形',
-                    unknown: '未辨識/非三角形'
-                  };
-                  const label = nameMap[j.label] || j.label || '—';
-                  const conf = j.confidence!=null ? Math.round(j.confidence*100) : null;
-                  const meta = j.meta || {};
-                  return (
-                    <div className="sent-card">
-                      <div className="sent-title">{label}（{tfLabels[(j.tf || tf) as string] || (j.tf || tf)}）</div>
-                      <div className="sent-metrics">
-                        <div className="sent-kv"><span>信心</span><span>{conf!=null? conf: '—'}%</span></div>
-                        <div className="sent-kv"><span>高點斜率</span><span>{meta.slope_high!=null ? Number(meta.slope_high).toFixed(6) : '—'}</span></div>
-                        <div className="sent-kv"><span>低點斜率</span><span>{meta.slope_low!=null ? Number(meta.slope_low).toFixed(6) : '—'}</span></div>
-                        <div className="sent-kv"><span>R2(高/低)</span><span>{meta.r2_high!=null ? Number(meta.r2_high).toFixed(2) : '—'} / {meta.r2_low!=null ? Number(meta.r2_low).toFixed(2) : '—'}</span></div>
-                        <div className="sent-kv"><span>範圍收斂比</span><span>{meta.contraction!=null ? Number(meta.contraction).toFixed(2) : '—'}</span></div>
-                      </div>
-                    </div>
-                  );
-                })()
-              )}
-            </div>
-            <div className="modal-footer">
-              <button className="btn" onClick={()=>setPatOpen(false)}>關閉</button>
-            </div>
-          </div>
-        </div>
-      )}
       <div className="toolbar" suppressHydrationWarning>
         <span className="label">代碼：</span>
         <div className="dropdown" ref={symbolMenuRef}>
@@ -1064,22 +970,7 @@ export default function HomePage() {
         <label className="check" suppressHydrationWarning>
           <input type="checkbox" checked={showVOL} onChange={e=>setShowVOL(e.target.checked)} /> 成交量
         </label>
-        <button className="btn btn-primary"
-          disabled={loading}
-          onClick={()=>{
-            setError(null);
-            if (!symbol.trim()) { alert('請先選擇或新增代碼'); return; }
-            setLoading(true);
-            fetchOhlcv(symbol, tf)
-              .then(pack=>{ seriesRef.current?.setData(pack.price); dataRef.current = pack.price as any; ma20DataRef.current = pack.ma20 as any; ma50DataRef.current = pack.ma50 as any; volDataRef.current = pack.vol as any; if (volRef.current) volRef.current.setData(pack.vol); if (ma20Ref.current) ma20Ref.current.setData(pack.ma20); if (ma50Ref.current) ma50Ref.current.setData(pack.ma50); chartRef.current?.timeScale().fitContent(); updateHighlight(); applyBtMarkers(btReport); })
-              .catch((e: unknown)=>{ const msg = e instanceof Error ? e.message : String(e); setError(msg); })
-              .finally(()=> setLoading(false));
-          }}
-        >
-          {loading ? '載入中…' : '載入'}
-        </button>
         <button className="btn" onClick={onFindSimilar}>找相似</button>
-        <button className="btn" onClick={onDetectPattern}>辨識型態</button>
         <button className="btn" onClick={()=>{
           if (!range.start || !range.end) { alert('請先在圖上點兩下選取回測期間'); return; }
           setBtOpen(true);
@@ -1107,32 +998,10 @@ export default function HomePage() {
           };
           return (
             <>
-              API：{API}　|　TF：{tf}　|　範圍：{rangeLabel || '—'}　|　選取區間：{show(range.start)} ~ {show(range.end)}
+              TF：{tf}　|　範圍：{rangeLabel || '—'}　|　選取區間：{show(range.start)} ~ {show(range.end)}
             </>
           );
         })()}
-      </div>
-      <div className="sentiment">
-        <div className="sent-card">
-          <div className="sent-title">個股情緒</div>
-          <div className="sent-metrics">
-            <div className="sent-kv"><span>狀態</span><span className="badge">{sentSym?.label || '—'}</span></div>
-            <div className="sent-kv"><span>分數</span><span>{sentSym ? Math.round(sentSym.score*100) : '—'}%</span></div>
-            <div className="sent-kv"><span>RSI(14)</span><span>{sentSym ? sentSym.rsi14.toFixed(1) : '—'}</span></div>
-            <div className="sent-kv"><span>趨勢斜率</span><span>{sentSym ? sentSym.slope_norm.toFixed(4) : '—'}</span></div>
-            <div className="sent-kv"><span>波動率(近60)</span><span>{sentSym ? (sentSym.vol*100).toFixed(2) : '—'}%</span></div>
-          </div>
-        </div>
-        <div className="sent-card">
-          <div className="sent-title">環境情緒</div>
-          <div className="sent-metrics">
-            <div className="sent-kv"><span>狀態</span><span className="badge">{sentEnv?.label || '—'}</span></div>
-            <div className="sent-kv"><span>樣本數</span><span>{sentEnv?.universe_size ?? 0}</span></div>
-            <div className="sent-kv"><span>MA50 之上</span><span>{sentEnv ? Math.round(sentEnv.pct_above_ma50*100) : '—'}%</span></div>
-            <div className="sent-kv"><span>MA20 之上</span><span>{sentEnv ? Math.round(sentEnv.pct_above_ma20*100) : '—'}%</span></div>
-            <div className="sent-kv"><span>平均 RSI</span><span>{sentEnv ? sentEnv.avg_rsi.toFixed(1) : '—'}</span></div>
-          </div>
-        </div>
       </div>
       <div className="news-card">
         <div className="news-title">新聞快照</div>

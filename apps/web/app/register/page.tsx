@@ -41,7 +41,7 @@ export default function RegisterPage() {
       <div className="auth-card">
         <div className="auth-header">
           <div className="auth-brand">
-            <span className="auth-logo">💹</span>
+            <span className="auth-logo"></span>
             <span className="auth-title">建立帳號</span>
           </div>
           <div className="auth-subtitle">快速開始，加入 FinWeb</div>

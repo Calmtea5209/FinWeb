@@ -1,7 +1,9 @@
 # FinWeb
 
-- 前端: Next.js (App Router, TypeScript) + lightweight-charts 顯示 K 線、MA、成交量、相似片段、簡易回測操作 UI。
-- 後端: FastAPI + SQLAlchemy + TimescaleDB / PostgreSQL，提供技術指標、相似片段搜尋、帳號/偏好、以及使用 SMA 回測。
+- 前端: Next.js (App Router, TypeScript) + lightweight-charts
+  - 顯示 K 線、MA、成交量、相似片段、簡易回測操作 UI。
+- 後端: FastAPI + SQLAlchemy + TimescaleDB / PostgreSQL
+  - 提供技術指標、相似片段搜尋、帳號/偏好、以及使用 SMA 回測。
 
 ## 功能總覽
 - K線圖 + 指標: MA20、MA50、成交量，可切換時間尺度 (5m/15m/1h/1d)。
